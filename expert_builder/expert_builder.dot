@@ -311,7 +311,7 @@ digraph expert_builder {
   PrepareRC [
     shape=parallelogram, label="Prepare reality check (params -> context)",
     parse_json="true",
-    tool_command="#!/bin/sh\nset -e\npython3 - <<'PYEOF'\nimport os, json, sys\nNL = chr(10)\ntry:\n    spec = open('.ai/clarified_spec.md').read()\nexcept Exception as e:\n    print('ERROR: cannot read .ai/clarified_spec.md: %s' % e, file=sys.stderr)\n    sys.exit(1)\ncwd = os.getcwd()\n# acceptance_criteria = the clarified intent, verbatim. Nothing is injected: the reality check\n# asserts what was actually ASKED FOR, not a requirement the submitter never wrote.\ncriteria = spec.rstrip() + chr(10)\nprint('[preparerc] software_path=%s ; acceptance_criteria=%d bytes (spec + RC extra req)' % (cwd, len(criteria)), file=sys.stderr)\nprint(json.dumps({'software_path': cwd, 'acceptance_criteria': criteria}))\nPYEOF"
+    tool_command="#!/bin/sh\nset -e\npython3 - <<'PYEOF'\nimport os, json, sys\nNL = chr(10)\ntry:\n    spec = open('.ai/clarified_spec.md').read()\nexcept Exception as e:\n    print('ERROR: cannot read .ai/clarified_spec.md: %s' % e, file=sys.stderr)\n    sys.exit(1)\ncwd = os.getcwd()\n# acceptance_criteria = the clarified intent, verbatim. Nothing is injected: the reality check\n# asserts what was actually ASKED FOR, not a requirement the submitter never wrote.\ncriteria = spec.rstrip() + chr(10)\nprint('[preparerc] software_path=%s ; acceptance_criteria=%d bytes (spec)' % (cwd, len(criteria)), file=sys.stderr)\nprint(json.dumps({'software_path': cwd, 'acceptance_criteria': criteria}))\nPYEOF"
   ];
 
   // ---------- RC: folder-node brick -> reality_check.dot (fresh DTU, file-push, probe) --------
