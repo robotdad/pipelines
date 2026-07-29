@@ -10,6 +10,7 @@ plugin-specific glue.
 
 | Pipeline | Status | Summary |
 |---|---|---|
+| [`admit/`](admit/) | working, verified | Admission gate: rejects a brief that cannot be built against. Headless, no human gate |
 | [`expert_builder/`](expert_builder/) | imported, unmodified | Greenfield build-from-spec spine: plan → implement → reality-check → deliver |
 
 ## Conventions
