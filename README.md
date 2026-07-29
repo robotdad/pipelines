@@ -10,27 +10,31 @@ plugin-specific glue.
 
 | Pipeline | Status | Summary |
 |---|---|---|
-| [`admit/`](admit/) | working, verified | Admission gate: rejects a brief that cannot be built against. Headless, no human gate |
-| [`expert_builder/`](expert_builder/) | verified end-to-end | Greenfield build-from-spec spine: admit → plan → implement → validate → reality-check → deliver |
+| [`expert_builder/`](expert_builder/) | working-tree closure verified; remote CI gate on push/PR | Greenfield build-from-spec spine: admit → plan → implement → validate → reality-check → deliver |
 
 ## Conventions
 
-One folder per pipeline. Each holds its `.dot` graph, any subgraph `.dot` files it invokes,
-and its supporting scripts and default data files.
+One folder per pipeline. Each published entrypoint is a closed package: its `.dot` graph, every
+static subgraph it invokes, and supporting data live at or below that entrypoint's directory.
+`expert_builder/admit/admit.dot` is an internal admission brick, not a sibling package.
 
 ### Running a pipeline
 
-A relative `dot_file=` on a `folder` node resolves against the **run working directory**, and box
-(LLM) nodes require the process working directory to equal `--cwd`. So run a pipeline from a
-directory that holds its bricks:
+A Resolve entrypoint names only the root DOT at a pinned Git commit:
 
 ```sh
-cd <workdir> && attractor run <pipeline>.dot --cwd .
+git+https://github.com/robotdad/pipelines@<40-char-sha>#subdirectory=expert_builder/expert_builder.dot
 ```
 
-For a build pipeline, copy the bricks into a scratch workdir first so generated output does not
-land in this repo. Cross-pipeline references work the same way — `dot_file="../admit/admit.dot"`
-resolves when the run workdir is the pipeline's own folder.
+Resolve recursively hydrates that root and its `dot_file` closure. Do not use sibling `../` paths
+or flatten copied DOT files as package validation: both bypass the published boundary. Before a
+push or pull request, run the working-tree closure test; CI runs that test and remote hydration
+against the pushed or PR commit:
+
+```sh
+uv run pytest -q -m 'not remote'
+PIPELINES_REMOTE_SHA=<40-char-sha> uv run pytest -q -m remote
+```
 
 Node shapes carry meaning:
 

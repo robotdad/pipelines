@@ -168,13 +168,10 @@
 //   brick addendum recorded in notes/eb-plan-contract.md / eb-implement-loop-contract.md.)
 // ============================================================================================
 //
-// FOLDER-PATH RESOLUTION GOTCHA (dgr standalone path)
-//   resolve_dot_path (pipeline.py) resolves a relative dot_file= against graph.source_dir; when
-//   that is empty (dgr never sets it on the PARENT graph) it falls back to context.target_dir,
-//   which dgr sets to --cwd. So under dgr the child bricks plan.dot / implement_loop.dot must be
-//   reachable from --cwd. The proof harness copies all three .dot files into the fresh run cwd,
-//   then runs `dgr run expert_builder.dot --cwd <thatdir>`. (In Resolve, source_dir is set
-//   from the pipeline package, so sibling bricks resolve without copying.)
+// PACKAGE RESOLUTION CONTRACT
+//   Resolve receives one SHA-pinned URI naming expert_builder.dot, then recursively hydrates every
+//   static dot_file dependency beneath this package root. Packaging validation must exercise that
+//   single-entrypoint hydration path; copying or flattening DOT files is not representative.
 //
 // COORDINATION is entirely via the .ai/ file substrate (relative to cwd), on ONE persistent
 // filesystem. The child inherits context.target_dir via context.clone(), so the child's tool
@@ -224,7 +221,7 @@ digraph expert_builder {
   // plan/implement/validate/reality-check cycle spent on an unbuildable brief.
   Admit [
     shape=folder, label="Admit",
-    dot_file="admit.dot",
+    dot_file="admit/admit.dot",
     outputs="admit_state"
   ];
 

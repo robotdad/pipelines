@@ -1,0 +1,20 @@
+[project]
+name = "robotdad-pipelines"
+version = "0.0.0+dev"
+description = "Package-level tests for RobotDad Attractor pipelines"
+requires-python = ">=3.11"
+dependencies = [
+    "amplifier-module-loop-pipeline @ git+https://github.com/microsoft/amplifier-bundle-attractor@main#subdirectory=modules/loop-pipeline",
+    "amplifier-resolver-dot-graph @ git+https://github.com/microsoft/amplifier-resolver-dot-graph@d2195427021500d2070012581751de5bacbf4bae",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+addopts = "-p no:amplifier_module"
+markers = [
+    "remote: fetches a SHA-pinned pipeline package through Resolve's production materializer",
+]
