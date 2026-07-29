@@ -11,12 +11,26 @@ plugin-specific glue.
 | Pipeline | Status | Summary |
 |---|---|---|
 | [`admit/`](admit/) | working, verified | Admission gate: rejects a brief that cannot be built against. Headless, no human gate |
-| [`expert_builder/`](expert_builder/) | imported, unmodified | Greenfield build-from-spec spine: plan → implement → reality-check → deliver |
+| [`expert_builder/`](expert_builder/) | verified end-to-end | Greenfield build-from-spec spine: admit → plan → implement → validate → reality-check → deliver |
 
 ## Conventions
 
 One folder per pipeline. Each holds its `.dot` graph, any subgraph `.dot` files it invokes,
 and its supporting scripts and default data files.
+
+### Running a pipeline
+
+A relative `dot_file=` on a `folder` node resolves against the **run working directory**, and box
+(LLM) nodes require the process working directory to equal `--cwd`. So run a pipeline from a
+directory that holds its bricks:
+
+```sh
+cd <workdir> && attractor run <pipeline>.dot --cwd .
+```
+
+For a build pipeline, copy the bricks into a scratch workdir first so generated output does not
+land in this repo. Cross-pipeline references work the same way — `dot_file="../admit/admit.dot"`
+resolves when the run workdir is the pipeline's own folder.
 
 Node shapes carry meaning:
 

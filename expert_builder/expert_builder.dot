@@ -61,10 +61,11 @@
 //     .ai/clarified_spec.md and does NOT hardcode any project-specific requirement. (The earlier
 //     step-5 proof baked a wordcount `--json` requirement into this prompt as its deterministic
 //     trigger; that was SUT-specific and has been REMOVED so the spine validates ANY build honestly
-//     against its own spec.) The step-6 deterministic ONE-ROUND-FAIL trigger now lives at the RC
-//     boundary instead (PrepareRC injects an extra hard acceptance requirement -- see STEP 6), the
-//     cleaner home for it: validate stays a faithful spec check, and the injected gap is what the
-//     ISOLATED reality-check is designed to catch. (Historical note: in the step-5 wordcount proof
+//     against its own spec.) A step-6 proof previously injected an extra hard acceptance
+//     requirement at the RC boundary (PrepareRC) so the isolated reality-check would deterministically
+//     fail round 1. That was a TEST FIXTURE living in the production graph -- it made every real run
+//     fail its first reality check against a requirement the submitter never wrote -- and has been
+//     REMOVED. PrepareRC now passes the clarified spec verbatim. (Historical note: in the step-5 wordcount proof
 //     the round-1 build genuinely lacked --json, UserRun caught it, Reopen appended a real fix task,
 //     Implement was re-invoked, resumable Init preserved markers, round-2 passed -- every mechanism
 //     real; that proof is recorded in notes/eb-check-outer-loops.md.)
@@ -212,8 +213,23 @@ digraph expert_builder {
   Seed [
     shape=parallelogram, label="Seed spec -> .ai/clarified_spec.md",
     tool_env="spec",
-    tool_command="#!/bin/sh\nset -e\nmkdir -p .ai\npython3 - <<'PYEOF'\nimport os, sys\nspec = os.environ.get('SPEC', '')\nif not spec.strip():\n    print('ERROR: spec param is empty. Pass --param spec=@yourspec.md so Seed can write .ai/clarified_spec.md.', file=sys.stderr)\n    sys.exit(1)\nopen('.ai/clarified_spec.md', 'w').write(spec if spec.endswith(chr(10)) else spec + chr(10))\nprint('[seed] wrote .ai/clarified_spec.md (%d bytes)' % len(spec), file=sys.stderr)\nprint('ok')\nPYEOF"
+    parse_json="true",
+    tool_command="#!/bin/sh\nset -e\nmkdir -p .ai\npython3 - <<'PYEOF'\nimport os, sys, json\nspec = os.environ.get('SPEC', '')\nif not spec.strip():\n    print('ERROR: spec param is empty. Pass --param spec=@yourspec.md so Seed can write .ai/clarified_spec.md.', file=sys.stderr)\n    sys.exit(1)\nopen('.ai/clarified_spec.md', 'w').write(spec if spec.endswith(chr(10)) else spec + chr(10))\nprint('[seed] wrote .ai/clarified_spec.md (%d bytes)' % len(spec), file=sys.stderr)\nprint(json.dumps({'inputs': '.ai/clarified_spec.md'}))\nPYEOF"
   ];
+
+  // ---------- Admit: folder-node brick -> gate the brief BEFORE paying for a build ----------
+  // Seed publishes context.inputs (the path admit's CollectInputs reads). admit.dot judges three
+  // criteria -- discernible goal, at least one observable statement of done, no self-contradiction
+  // -- and publishes admit_state. Rejecting here costs one cheap LLM read instead of a whole
+  // plan/implement/validate/reality-check cycle spent on an unbuildable brief.
+  Admit [
+    shape=folder, label="Admit",
+    dot_file="admit.dot",
+    outputs="admit_state"
+  ];
+
+  // ---------- CheckAdmit: parent-owned routing on the surfaced admit_state ----------
+  CheckAdmit [shape=diamond, label="Brief admissible?"];
 
   // ---------- Plan: folder-node brick -> emits .ai/plan/ (INDEX + task_NN_*.md) ----------
   // Surfaces plan.dot's terminal verdict as context.plan_state via outputs= (see header).
@@ -293,13 +309,12 @@ digraph expert_builder {
   // to the child (DetectDUT reads $software_path/$acceptance_criteria; tool_env reads the UPPERCASE
   // forms). NO /project/.resolve/config.json patch, NO gitea commit/push -- reality_check
   // file-pushes the local workspace dir (no remote). software_path = the ABSOLUTE run cwd (the built
-  // workspace); acceptance_criteria = .ai/clarified_spec.md contents PLUS the extra hard RC
-  // requirement that drives the deterministic one-round fail (GET /items/{id}). Diagnostics to
+  // workspace); acceptance_criteria = .ai/clarified_spec.md contents, VERBATIM. Diagnostics to
   // stderr; stdout is JSON only.
   PrepareRC [
     shape=parallelogram, label="Prepare reality check (params -> context)",
     parse_json="true",
-    tool_command="#!/bin/sh\nset -e\npython3 - <<'PYEOF'\nimport os, json, sys\nNL = chr(10)\ntry:\n    spec = open('.ai/clarified_spec.md').read()\nexcept Exception as e:\n    print('ERROR: cannot read .ai/clarified_spec.md: %s' % e, file=sys.stderr)\n    sys.exit(1)\ncwd = os.getcwd()\n# acceptance_criteria = the ORIGINAL clarified intent PLUS an explicit extra RC requirement.\n# The extra requirement (GET /items/ID) is deliberately NOT in the build spec, so the round-1\n# build genuinely lacks it and the isolated RC catches it -- the honest one-round-fail trigger.\nextra = (NL + NL + '## Additional hard acceptance requirement (reality-check)' + NL\n         + 'In ADDITION to the endpoints above, the running service MUST support:' + NL\n         + '- GET /items/ID returns HTTP 200 with a JSON object having integer id and string name '\n         + 'for the item with that id (e.g. after creating an item, GET /items/1 returns exactly that '\n         + 'item, with the same id and name). A non-existent id returns HTTP 404.' + NL\n         + 'Concretely verify: create an item via POST /items, then GET /items/<that id> returns 200 '\n         + 'with the same id and name.' + NL)\ncriteria = spec.rstrip() + extra\nprint('[preparerc] software_path=%s ; acceptance_criteria=%d bytes (spec + RC extra req)' % (cwd, len(criteria)), file=sys.stderr)\nprint(json.dumps({'software_path': cwd, 'acceptance_criteria': criteria}))\nPYEOF"
+    tool_command="#!/bin/sh\nset -e\npython3 - <<'PYEOF'\nimport os, json, sys\nNL = chr(10)\ntry:\n    spec = open('.ai/clarified_spec.md').read()\nexcept Exception as e:\n    print('ERROR: cannot read .ai/clarified_spec.md: %s' % e, file=sys.stderr)\n    sys.exit(1)\ncwd = os.getcwd()\n# acceptance_criteria = the clarified intent, verbatim. Nothing is injected: the reality check\n# asserts what was actually ASKED FOR, not a requirement the submitter never wrote.\ncriteria = spec.rstrip() + chr(10)\nprint('[preparerc] software_path=%s ; acceptance_criteria=%d bytes (spec + RC extra req)' % (cwd, len(criteria)), file=sys.stderr)\nprint(json.dumps({'software_path': cwd, 'acceptance_criteria': criteria}))\nPYEOF"
   ];
 
   // ---------- RC: folder-node brick -> reality_check.dot (fresh DTU, file-push, probe) --------
@@ -354,7 +369,11 @@ digraph expert_builder {
 
   // ---------- Edges ----------
   start -> Seed;
-  Seed  -> Plan;
+  Seed  -> Admit;
+  Admit -> CheckAdmit;
+  // admitted -> plan; rejected -> stop at the door (reason in .ai/admit/summary.md)
+  CheckAdmit -> Plan [condition="context.admit_state=admitted", label="admitted"];
+  CheckAdmit -> done [condition="context.admit_state=rejected", label="rejected"];
   Plan  -> CheckPlan;
   // plan_ok -> hand the verified .ai/plan/ to the Implement brick; plan_failed -> stop (surfaced, not hidden)
   CheckPlan -> Implement [condition="context.plan_state=plan_ok",     label="plan_ok"];
