@@ -1,0 +1,109 @@
+// deliver.dot -- the FINALIZE brick of the decomposed, DTU-first expert_builder.
+//
+// WHAT IT IS
+//   The minimal delivery phase: turn a built, task-marked workspace into a clear,
+//   user-facing deliverable + a local commit. Extracted from expert_builder.dot Step 7
+//   (Deliver -> DeliverFinalize), STRIPPED of every Resolve-specific bit: no gitea push,
+//   no /project/.resolve/data/delivery.md platform note, no /project/... paths, no
+//   hardcoded /opt/uv-tools python. It is DTU-first / local: it commits the workspace
+//   in place. Publishing to a remote (GitHub) is a SEPARATE optional brick
+//   (publish_new_repo.dot), composed AFTER this one when the user wants it.
+//
+// THE STUD (filesystem contract, relative to cwd):
+//   INPUTS  (caller preconditions -- what implement_loop + plan already left on disk):
+//     .ai/clarified_spec.md        -- REQUIRED: what was asked for
+//     .ai/plan/PROGRESS.md         -- the breadcrumb trail with the ACTUAL validated
+//                                     install/run commands each task recorded
+//     README.md (optional) + built source files in the workspace
+//     cwd is a workspace that is a git repo
+//   OUTPUTS (postconditions on delivered):
+//     README.md                    -- user-facing readme (one-line summary; What this is;
+//                                     Install; Usage w/ 1-3 runnable examples + expected output)
+//     .ai/delivery_summary.md      -- short skimmable delivery note
+//     a local git commit of the whole workspace (--allow-empty ok)
+//   ROUTING SIGNAL: deliver_state = delivered  (single success terminal -- nothing routes
+//     on it in the spine; surfaced for folder-node consistency/observability, matching the
+//     plan_state/impl_state convention of the sibling bricks).
+//
+// USE ONLY REAL VALIDATED COMMANDS
+//   The Deliver agent MUST derive install/usage from what is on disk -- the spec, the
+//   source, and above all .ai/plan/PROGRESS.md (which records the commands that were
+//   actually run and passed). It must NOT invent, guess, or alter commands/flags/filenames.
+//   This is the whole reason PROGRESS.md carries the real commands forward.
+//
+// WHAT THIS SHEDS vs the original DeliverFinalize (Resolve glue -- see manifest)
+//   - gitea push (`git push origin HEAD:main`)                 -- DROPPED (no remote; local commit only)
+//   - /project/.resolve/data/delivery.md platform note write   -- DROPPED (no platform)
+//   - instance_id / origin-remote-url derivation               -- DROPPED (irrelevant locally)
+//   - python3, /project/workspace   -- `python3`, relative cwd
+//
+// ESCAPING (why this looks the way it does -- matches proven sibling plan.dot / implement_loop.dot)
+//   - This file is run by dgr directly AND loaded as a shape=folder subgraph inside the
+//     spine / expert_builder.dot. In the file+subgraph path, tool_command uses SINGLE
+//     \n as the line separator (NOT the \\n of the resolver's dot_content path) and each
+//     shell body is a Python heredoc for all git/file I/O -- escape-path robust.
+//   - chr(10) is used for literal newlines in Python (NOT '\n', which DOT _parse_value would
+//     corrupt into a real newline mid-token).
+//   - Diagnostics go to stderr; DeliverFinalize's routing label is the LAST stdout line;
+//     Report's stdout is a JSON object ONLY (parse_json) so json.loads over stdout succeeds.
+//
+// PARAMS (dgr --param k=v): none. Deliver reads everything from disk. (deliver model is a
+//   hardcoded knob below: claude-sonnet-4-5 -- the cheaper local default, matching the sibling
+//   bricks. The original used opus; llm_model attributes cannot reference env vars, so override
+//   by forking this DOT.)
+
+digraph deliver {
+  graph [
+    label="Deliver -- built workspace -> user-facing README + delivery summary + local commit",
+    goal="Write a clear README.md and .ai/delivery_summary.md using ONLY the real validated commands, then commit the workspace locally.",
+    rankdir="LR",
+    default_max_retry="1",
+    default_fidelity="truncate"
+  ];
+
+  Start [shape=Mdiamond, label="Start"];
+  Exit  [shape=Msquare,  label="Exit"];
+
+  // ---------- Deliver: LLM agent writes the user-facing README + delivery summary ----------
+  // goal_gate + fidelity=full: full context to read the spec, source, and PROGRESS.md and
+  // produce docs from ONLY the validated commands. Prompt reused from expert_builder Step 7,
+  // STRIPPED of Resolve bits (no gitea/platform note -- that is DeliverFinalize/publish's job).
+  Deliver [
+    shape=box, label="Prepare delivery",
+    goal_gate="true",
+    fidelity="full",
+    llm_provider="anthropic", llm_model="claude-sonnet-4-5",
+    max_agent_turns="40", timeout="1800s",
+    prompt="You are preparing the FINAL delivery of a project that has already been built and task-verified. Make the deliverable clear for a user who will observe and try it. All paths are relative to your current working directory.\n\nFIRST read: .ai/clarified_spec.md (what was asked for), the existing README.md (if any) and the source files in the workspace, and .ai/plan/PROGRESS.md (it records the ACTUAL install and run commands that were validated as each task was implemented). Use ONLY those real, validated commands. Do NOT invent, guess, or alter commands, flags, or file names. If PROGRESS.md shows the project is run as 'python3 wordcount.py <path>' and tested with 'python3 -m pytest', those are the commands you use verbatim.\n\nThen write TWO files:\n\n1. README.md at the workspace root: a clear, concise, user-facing readme. It MUST contain, in order: a one-line summary; a short 'What this is' paragraph describing what was built; an 'Install' section with the exact minimal commands (or state 'No installation needed' if it is standard-library only); a 'Usage' section with 1 to 3 concrete runnable examples and their expected output. Keep the real validated commands verbatim. Do not pad it with filler.\n\n2. .ai/delivery_summary.md: a short delivery note the user reads first. 2 to 4 sentences on what was built, then a concise 'Install' and 'Use' section with one real example. Skimmable.\n\nWrite both files now, then call report_outcome with status='success' and a one-line summary of what was built."
+  ];
+
+  // ---------- DeliverFinalize: deterministic LOCAL commit (no push, no platform note) ----------
+  // git add -A + commit the whole workspace locally (allow-empty ok -- a commit is a delivery
+  // breadcrumb even if the tree was already committed). Sets git user.email/user.name via -c so
+  // the commit works in a bare fresh repo with no configured identity. Fails loud (exit 1) only
+  // if cwd is not a git repo (caller precondition). Diagnostics to stderr; routing label last on
+  // stdout. NO gitea push, NO /project/.resolve/data/delivery.md -- those Resolve bits are shed.
+  DeliverFinalize [
+    shape=parallelogram, label="Finalize delivery (local commit)",
+    tool_command="#!/bin/sh\nset -e\npython3 - <<'PYEOF'\nimport os, subprocess, sys\nif not os.path.isdir('.git'):\n    inside = subprocess.run(['git', 'rev-parse', '--is-inside-work-tree'], capture_output=True, text=True)\n    if inside.stdout.strip() != 'true':\n        print('ERROR: cwd is not a git repository. deliver requires a git workspace to commit.', file=sys.stderr)\n        sys.exit(1)\nsubprocess.run(['git', 'add', '-A'], check=True)\ncommit = subprocess.run(['git', '-c', 'user.email=expert-builder@local', '-c', 'user.name=expert-builder', 'commit', '-m', 'expert_builder: finalize delivery (clear README + delivery summary)', '--allow-empty'], capture_output=True, text=True)\nsys.stderr.write(commit.stdout + commit.stderr)\nhead = subprocess.run(['git', 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True).stdout.strip()\nreadme = os.path.isfile('README.md')\nsummary = os.path.isfile('.ai/delivery_summary.md')\nprint('[deliver_finalize] committed=%s README.md=%s delivery_summary=%s' % (head, readme, summary), file=sys.stderr)\nprint('delivered')\nPYEOF"
+  ];
+
+  // ---------- Report: write a run summary + emit the NAMED verdict (terminal) ----------
+  // FOLDER-NODE ADDENDUM (same convention as plan.dot / implement_loop.dot): emit the terminal
+  // verdict as a NAMED context key `deliver_state` (parse_json) so a parent folder node can
+  // surface it via outputs="deliver_state". Standalone this is inert extra state; nothing in the
+  // spine routes on it -- it is declared for consistency/observability. deliver_state is always
+  // 'delivered' (single success terminal). stdout is the JSON object ONLY (diagnostics to stderr)
+  // so json.loads() over the whole stdout succeeds.
+  Report [
+    shape=parallelogram, label="Report",
+    parse_json="true",
+    tool_command="#!/bin/sh\nset -e\npython3 - <<'PYEOF'\nimport os, json, subprocess, sys\nnl = chr(10)\nreadme = os.path.isfile('README.md')\nsummary = os.path.isfile('.ai/delivery_summary.md')\nhead = subprocess.run(['git', 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True).stdout.strip() or 'unknown'\nlines = ['# Delivery Run Summary', '']\nlines.append('- Result: delivered')\nlines.append('- README.md written: ' + str(readme))\nlines.append('- .ai/delivery_summary.md written: ' + str(summary))\nlines.append('- Delivery commit: ' + head)\nopen('.ai/delivery_run_summary.md', 'w').write(nl.join(lines) + nl)\nprint('[report] delivered README=%s summary=%s commit=%s' % (readme, summary, head), file=sys.stderr)\nprint(json.dumps({'deliver_state': 'delivered'}))\nPYEOF"
+  ];
+
+  // ---------- Edges ----------
+  Start           -> Deliver;
+  Deliver         -> DeliverFinalize;
+  DeliverFinalize -> Report;
+  Report          -> Exit;
+}

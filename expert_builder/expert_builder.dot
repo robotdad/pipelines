@@ -1,0 +1,401 @@
+// expert_builder.dot -- the full DTU-first local expert_builder pipeline (proven end-to-end).
+//
+// CANONICAL. This file supersedes the earlier hand-written orchestrator SKETCH (also once named
+// expert_builder.dot, now retired): it is the grown-and-PROVEN pipeline, built brick-by-brick
+// and validated at each step (see notes/eb-composition-manifest.md build order + notes/eb-spine-
+// orchestrator.md). The OPTIONAL front/back bricks (decompose_spike.dot, clarify.dot,
+// publish_new_repo.dot) are intentionally NOT wired here -- they compose around this core.
+//
+// WHAT IT IS
+//   The ORCHESTRATED (not hand-chained) expert_builder: it composes the proven bricks -- plan.dot,
+//   implement_loop.dot, reality_check.dot, deliver.dot -- as shape=folder subgraphs under a
+//   thin parent orchestrator, plus deterministic glue (Seed, the validate + RC classify/reopen
+//   nodes). It also proved the folder-node output-surfacing mechanism: HOW a folder-node subgraph's
+//   terminal routing var surfaces to the PARENT's diamond (via outputs= copy-up on child success).
+//
+//   Pipeline (FULL): start -> Seed -> Plan[folder] -> CheckPlan -> Implement[folder]
+//              -> CheckImpl -> UserRun -> ReadVerdict -> CheckVal
+//              -> PrepareRC -> RC[folder reality_check.dot] -> RCClassify -> CheckRC
+//              -> Deliver[folder] -> done
+//              (all_done flows through VALIDATE, then an isolated REALITY-CHECK in a fresh DTU,
+//               before delivery; BOTH validate AND RC, on failure, RE-ENTER the Implement folder
+//               node -- the two architecturally significant fix loops).
+//   The reality-check phase is NOW WIRED IN (step 6): RC is a SECOND independent-check outer loop,
+//   the isolated sibling of the (cheap, in-workspace) validate loop. It runs reality_check.dot
+//   as a folder node -- a fresh DTU is spun, the built workspace file-pushed in, deployed + probed;
+//   the verdict lands in .rc/verdict.json in the SHARED run cwd (folder nodes share the filesystem),
+//   which RCClassify reads directly (no outputs= needed on the RC folder node -- same as ReadVerdict
+//   reads .ai/validation/verdict.json).
+//   Deliver is the third proven brick (deliver.dot: README + delivery summary + local commit;
+//   Resolve gitea-push/platform-note bits shed -- publish to a remote is a separate optional
+//   brick, publish_new_repo.dot).
+//
+// ============================================================================================
+// STEP 5 -- THE VALIDATE GATE + THE FIX LOOP THAT RE-DRIVES THE IMPLEMENT FOLDER NODE
+// --------------------------------------------------------------------------------------------
+//   This is the end-to-end proof of the ownership / resumable-Init design decision
+//   (notes/eb-implement-loop-contract.md "Ownership", notes/eb-check-outer-loops.md). The
+//   original expert_builder is a FLAT graph where the validate fix edge re-enters the shared
+//   Implement NODE (never Init) to preserve progress, and Reopen MANUALLY resets impl_state.json.
+//   Across a FOLDER-NODE boundary you cannot jump into a subgraph's middle -- so instead the
+//   thin orchestrator RE-INVOKES the whole Implement folder node, and implement_loop's RESUMABLE
+//   Init re-arms the counter + preserves prior .done markers / PROGRESS.md itself. Consequence:
+//   Reopen does NOT reset impl_state.json (the original did) -- Init owns re-arm now. Confirmed
+//   empirically: implement_loop Init unconditionally rewrites .ai/impl_state.json (iter=0,
+//   prev_remaining=recount) on EVERY entry, so no caller reset is needed or wanted.
+//
+//   THE VALIDATE NODES ARE INLINE in the orchestrator (NOT folder nodes) -- so val_state surfaces
+//   via the normal deterministic tool idiom (tool.last_line / parse_json), NO outputs= needed:
+//     UserRun     (box, LLM, goal_gate) -- install & run the build, test the spec's core + edge
+//                 inputs AS A USER, write .ai/validation/verdict.json
+//                 {result, fault, fix_request, evidence}.
+//     ReadVerdict (parallelogram, deterministic, parse_json) -- read verdict.json + a bounded
+//                 round counter in .ai/validation/state.json (max_rounds default 3). result=pass
+//                 -> val_state=pass; fault=harness -> blocked; else round++ -> exhausted if over
+//                 cap else fix. Emits {"val_state": ...} (parse_json surfaces context.val_state).
+//     Reopen      (parallelogram, deterministic) -- append task_NN_fix_<round>.md + its INDEX line
+//                 describing fix_request; then route into Implement (loop_restart=true). Does NOT
+//                 reset impl_state (resumable Init owns re-arm).
+//
+//   UserRun IS SUT-AGNOSTIC (generalized 2026-07-10 during step 6): it validates strictly against
+//     .ai/clarified_spec.md and does NOT hardcode any project-specific requirement. (The earlier
+//     step-5 proof baked a wordcount `--json` requirement into this prompt as its deterministic
+//     trigger; that was SUT-specific and has been REMOVED so the spine validates ANY build honestly
+//     against its own spec.) The step-6 deterministic ONE-ROUND-FAIL trigger now lives at the RC
+//     boundary instead (PrepareRC injects an extra hard acceptance requirement -- see STEP 6), the
+//     cleaner home for it: validate stays a faithful spec check, and the injected gap is what the
+//     ISOLATED reality-check is designed to catch. (Historical note: in the step-5 wordcount proof
+//     the round-1 build genuinely lacked --json, UserRun caught it, Reopen appended a real fix task,
+//     Implement was re-invoked, resumable Init preserved markers, round-2 passed -- every mechanism
+//     real; that proof is recorded in notes/eb-check-outer-loops.md.)
+// ============================================================================================
+//
+// ============================================================================================
+// STEP 6 -- THE ISOLATED REALITY-CHECK GATE + ITS FIX LOOP (the second, stronger outer loop)
+// --------------------------------------------------------------------------------------------
+//   RC is the SAME outer-loop shape as validate (notes/eb-check-outer-loops.md: both are
+//   independent checks that wrap implement_loop and re-drive it on failure), but the check runs
+//   in a FRESH ISOLATED DTU -- the one environment boundary (notes/execution-substrate-targets.md)
+//   -- via our proven reality_check.dot, composed here as a FOLDER NODE. The original
+//   expert_builder Step 6 (PrepareRC -> DeliverGitea -> RealityCheck -> RCClassify -> CheckRC ->
+//   BuildRCFix) is ported with ALL RESOLVE GLUE SHED.
+//
+//   PrepareRC (deterministic, parse_json) -- SHEDS the Resolve glue entirely:
+//     * NO /project/.resolve/config.json patch, NO DeliverGitea/gitea commit+push.
+//     * Instead it sets the TWO params reality_check needs as PARENT CONTEXT KEYS, by
+//       emitting them as stdout JSON under parse_json=true (tool.py:183-189 does context.set(key,
+//       value) for each -- BARE keys, no dot prefix):
+//         software_path       = the ABSOLUTE built-workspace dir (the run cwd). reality_check
+//                               accepts a local dir OR a git URL; a local dir file-pushes with no
+//                               remote (notes/execution-substrate-targets.md file-push transport).
+//         acceptance_criteria = the contents of .ai/clarified_spec.md, PLUS an explicit extra RC
+//                               requirement block (see the DETERMINISTIC FAIL TRIGGER below).
+//     HOW THESE REACH THE RC FOLDER-NODE CHILD (confirmed against the engine):
+//       handlers/pipeline.py:163 clones the PARENT context into the child, so every bare parent
+//       key is visible to the child. reality_check's box node DetectDUT expands
+//       $software_path / $acceptance_criteria / $sut_port from context.snapshot() PLAIN keys
+//       (codergen.py:164-171, "." not in k), and its tool nodes read SOFTWARE_PATH/ACCEPTANCE_
+//       CRITERIA/SUT_PORT via tool_env -> context.get(bare) -> env[UPPER] (tool.py:109-116). Both
+//       resolve the BARE context key -- exactly what PrepareRC sets. So the same keys that worked
+//       standalone via `dgr --param software_path=... --param acceptance_criteria=...` now arrive
+//       by CONTEXT INHERITANCE instead. No --param plumbing, no outputs= on the way IN.
+//
+//   RC (folder node -> reality_check.dot):
+//     Runs the whole detect -> launch DTU -> push SUT -> deploy -> validate -> verdict -> teardown
+//     flow in a fresh DTU. Writes .rc/verdict.json {verdict: pass|partial|fail, dtu, findings} to
+//     the CALLER cwd (RenderPass/RenderPartial/SetFail all `mkdir -p .rc; tee .rc/verdict.json`).
+//     BECAUSE folder nodes share the run cwd filesystem, RCClassify reads that FILE directly --
+//     so NO outputs= is declared on the RC folder node (contrast Plan/Implement/Deliver, whose
+//     verdicts live only in the child's cloned CONTEXT and therefore need outputs=). RC's verdict
+//     is a FILE on the shared disk, exactly like validate's .ai/validation/verdict.json.
+//
+//   RCClassify (deterministic, parse_json) -- read .rc/verdict.json + a bounded rc-round counter in
+//     .ai/rc_fix_state.json (max_rounds default 2). verdict=pass -> rc_pass; else rc_rounds++ and
+//     rc_state = rc_exhausted (over cap, honest partial terminal) | rc_fix. Emits {"rc_state": ...}.
+//     A missing/unreadable verdict counts as fail (bounded by the counter) -- never a silent pass.
+//
+//   BuildRCFix (deterministic) -- append a task_NN_rcfix_<round>.md to .ai/plan/ + its INDEX line,
+//     embedding the RC findings so the implementer targets the REAL failing acceptance. Per the
+//     resumable-Init decision (identical to validate's Reopen) it does NOT reset .ai/impl_state.json
+//     -- implement_loop's resumable Init re-arms on re-entry, preserving prior .done markers +
+//     PROGRESS.md. Then loop_restart into the Implement folder node. (The original expert_builder
+//     BuildRCFix manually rewrote impl_state.json before jumping to the shared Implement NODE; here,
+//     across the folder-node boundary, we re-invoke the whole brick and let its Init re-arm -- the
+//     same mechanism the validate loop already proved.)
+//
+//   DETERMINISTIC ONE-ROUND RC-FAIL TRIGGER (documented honestly; the MECHANISM is real, not faked):
+//     The Seed spec (.ai/clarified_spec.md) asks for an HTTP items service with /health, POST /items,
+//     GET /items -- but deliberately NOT GET /items/{id}. PrepareRC's acceptance_criteria appends an
+//     EXPLICIT hard RC requirement: "GET /items/{id} returns 200 with that single item." (This is the
+//     exact analog of validate's UserRun prompt injecting the --json requirement on top of the spec --
+//     the extra requirement is stated at the CHECK boundary.) So the round-1 build genuinely lacks
+//     GET /items/{id}; the RC QA agent REALLY curls GET /items/1 inside the DTU, REALLY observes a 404,
+//     and writes verdict=partial. RCClassify -> rc_fix; BuildRCFix appends a REAL rcfix task; the
+//     Implement folder node is REALLY re-invoked; resumable Init preserves the prior markers and
+//     implements ONLY the new /items/{id} task; round-2 RC spins a FRESH DTU, re-probes, and now
+//     verdict=pass -> rc_pass -> Deliver. Every mechanism is real: the DTU lifecycle, the file-push,
+//     the in-DTU probe, the appended task, the re-entry, the final independent check.
+// ============================================================================================
+//
+// ============================================================================================
+// THE RESOLVED FOLDER-NODE OUTPUT MECHANISM (the whole point of this step)
+// --------------------------------------------------------------------------------------------
+//   A shape=folder node runs its child .dot in a CLONED context (handlers/pipeline.py:163).
+//   Child mutations do NOT auto-propagate. On child SUCCESS, ONLY the keys named in the folder
+//   node's outputs= attr are copied from the child's final context snapshot back to the parent
+//   (pipeline.py:295-304: context.set(key, child_snapshot[key])).
+//
+//   So for CheckPlan to read context.plan_state, TWO things must hold:
+//     1. The child (plan.dot) must SET a context key literally named `plan_state` before it
+//        exits. plan.dot's terminal Report node does this via parse_json=true + a stdout JSON
+//        object {"plan_state": "<verdict>"} (the tool handler json-parses stdout and does
+//        context.set for each key -- handlers/tool.py:183-189). The verdict is the last_routing
+//        recorded by VerifyPlan on EVERY exit path (plan_ok | plan_failed).
+//     2. THIS folder node declares outputs="plan_state" so that key is surfaced to the parent.
+//   Same pattern for Implement -> impl_state (Verify's last_routing: all_done|stalled|max_iter).
+//
+//   The parent condition context.plan_state=plan_ok resolves via conditions.py:_resolve_key,
+//   which tries "context.plan_state" then strips the prefix and tries the bare key "plan_state"
+//   -- so a bare surfaced key matches a context.<key>= condition. This is the SAME shipped
+//   pattern as dev_machine.dot's SecurityReview (outputs="sec_state,...") and dtu_validate.dot
+//   (outputs="dtu.result,dtu.feedback"): the parent owns routing; the child only publishes a
+//   named verdict. See notes/resolver-folder-node-mechanism.md.
+//
+//   WHY tool.last_line could NOT be reused directly: the LAST node in each brick is Report,
+//   whose stdout is the JSON object -- so at child exit tool.last_line would be that JSON blob,
+//   not the routing label. A NAMED key set explicitly is the robust surface. (This is the small
+//   brick addendum recorded in notes/eb-plan-contract.md / eb-implement-loop-contract.md.)
+// ============================================================================================
+//
+// FOLDER-PATH RESOLUTION GOTCHA (dgr standalone path)
+//   resolve_dot_path (pipeline.py) resolves a relative dot_file= against graph.source_dir; when
+//   that is empty (dgr never sets it on the PARENT graph) it falls back to context.target_dir,
+//   which dgr sets to --cwd. So under dgr the child bricks plan.dot / implement_loop.dot must be
+//   reachable from --cwd. The proof harness copies all three .dot files into the fresh run cwd,
+//   then runs `dgr run expert_builder.dot --cwd <thatdir>`. (In Resolve, source_dir is set
+//   from the pipeline package, so sibling bricks resolve without copying.)
+//
+// COORDINATION is entirely via the .ai/ file substrate (relative to cwd), on ONE persistent
+// filesystem. The child inherits context.target_dir via context.clone(), so the child's tool
+// nodes ALSO run rooted at --cwd -- .ai/plan/ produced by Plan is the SAME .ai/plan/ Implement
+// consumes. That shared substrate is what makes the handoff work.
+//
+// PARAMS (dgr --param k=v):
+//   spec            -- REQUIRED. The clarified spec TEXT (use --param spec=@specfile.md). Seed
+//                      writes it verbatim to .ai/clarified_spec.md (plan.dot's stable input stud).
+//   max_retries     -- forwarded to Plan (plan.dot MAX_RETRIES; default 2).
+//   max_iterations  -- forwarded to Implement (implement_loop MAX_ITERATIONS; default 20).
+//   stall_iterations-- forwarded to Implement (implement_loop STALL_ITERATIONS; default 3).
+//   max_rounds      -- validate fix-round cap (ReadVerdict MAX_ROUNDS; default 3). round>cap
+//                      -> val_state=exhausted (honest partial terminal), not an infinite fix loop.
+//   rc_max_rounds   -- reality-check fix-round cap (RCClassify RC_MAX_ROUNDS; default 2). round>cap
+//                      -> rc_state=rc_exhausted (honest partial terminal), not an infinite RC loop.
+
+digraph expert_builder {
+  graph [
+    label="Expert Builder (local, DTU-first) -- Seed -> plan -> implement -> validate -> reality-check -> deliver",
+    goal="Turn a clarified spec into built, task-marked software by composing plan.dot then implement_loop.dot as folder nodes, with the parent owning the routing diamonds.",
+    rankdir="LR",
+    default_max_retry="1",
+    default_fidelity="truncate"
+  ];
+
+  start [shape=Mdiamond, label="Start"];
+  done  [shape=Msquare,  label="Done"];
+
+  // ---------- Seed: deterministic glue -- write the spec param to .ai/clarified_spec.md ----------
+  // Headless spec source (resolved decision 1 in eb-plan-contract): keep plan's input a stable
+  // stud (.ai/clarified_spec.md) regardless of whether a clarify phase ran. The spec param
+  // arrives ONLY as the uppercase env var SPEC (tool_env); we write it verbatim via a Python
+  // heredoc so multi-line spec text with any shell metacharacters is safe. Fails loud (exit 1)
+  // if SPEC is empty. Diagnostics to stderr; stdout is just an 'ok' breadcrumb.
+  Seed [
+    shape=parallelogram, label="Seed spec -> .ai/clarified_spec.md",
+    tool_env="spec",
+    tool_command="#!/bin/sh\nset -e\nmkdir -p .ai\npython3 - <<'PYEOF'\nimport os, sys\nspec = os.environ.get('SPEC', '')\nif not spec.strip():\n    print('ERROR: spec param is empty. Pass --param spec=@yourspec.md so Seed can write .ai/clarified_spec.md.', file=sys.stderr)\n    sys.exit(1)\nopen('.ai/clarified_spec.md', 'w').write(spec if spec.endswith(chr(10)) else spec + chr(10))\nprint('[seed] wrote .ai/clarified_spec.md (%d bytes)' % len(spec), file=sys.stderr)\nprint('ok')\nPYEOF"
+  ];
+
+  // ---------- Plan: folder-node brick -> emits .ai/plan/ (INDEX + task_NN_*.md) ----------
+  // Surfaces plan.dot's terminal verdict as context.plan_state via outputs= (see header).
+  Plan [
+    shape=folder, label="Plan",
+    dot_file="plan.dot",
+    outputs="plan_state"
+  ];
+
+  // ---------- CheckPlan: parent-owned routing on the surfaced plan_state ----------
+  CheckPlan [shape=diamond, label="Plan ready?"];
+
+  // ---------- Implement: folder-node brick -> builds source, marks .done, resumable Init ----------
+  // Surfaces implement_loop's terminal verdict as context.impl_state via outputs= (see header).
+  Implement [
+    shape=folder, label="Implement loop",
+    dot_file="implement_loop.dot",
+    outputs="impl_state"
+  ];
+
+  // ---------- CheckImpl: parent-owned routing on the surfaced impl_state ----------
+  CheckImpl [shape=diamond, label="All tasks done?"];
+
+  // ============================================================================================
+  // STEP 5 -- VALIDATE (inline in the orchestrator; val_state via tool.last_line/parse_json)
+  // ============================================================================================
+
+  // ---------- UserRun: the INDEPENDENT check -- use the build like a new user, write a verdict --
+  // LLM box (goal_gate, fidelity=full). Reads .ai/clarified_spec.md + README + PROGRESS.md, builds
+  // a checklist of core + edge inputs, ACTUALLY installs & runs the build, and -- crucially for the
+  // deterministic one-round trigger -- verifies the REQUIRED machine-readable --json output mode
+  // (see header). Writes .ai/validation/verdict.json {result, fault, fix_request, evidence}. This is
+  // an independent judge OUTSIDE implement_loop (a loop cannot be its own judge -- the marker gate
+  // only trusts the agent self-marking; notes/eb-implement-loop-contract.md honest caveat).
+  UserRun [
+    shape=box, label="Use it like a user",
+    goal_gate="true",
+    fidelity="full",
+    llm_provider="anthropic", llm_model="claude-sonnet-4-5",
+    max_agent_turns="80", timeout="1800s",
+    allow_partial="true",
+    prompt="You are validating a freshly built project by USING it exactly as a new user would, and you must test it to COMPLETION: not just that it starts, but that it actually satisfies the requirements in its specification across the inputs a user expects, including edge cases. All paths are relative to your current working directory.\n\nFIRST read .ai/clarified_spec.md -- this is the AUTHORITATIVE statement of what the project must do. Then read README.md and any usage docs, plus .ai/plan/PROGRESS.md (how the build is run and any gotchas). From the SPEC, write a short checklist of the CORE requirements and representative AND edge/boundary inputs to exercise. Derive the checklist ONLY from .ai/clarified_spec.md -- do not invent requirements the spec does not state, and do not assume any particular kind of project (CLI, HTTP service, library, ...); let the spec tell you what to run and how.\n\nThen ACTUALLY use the project with the shell tool. Install/build/run it the documented way (for a standard-library-only Python program there is usually nothing to install; for an HTTP service, start it and probe its endpoints with curl; for a CLI, run it on real inputs). \n1. Exercise every CORE requirement from the spec on several inputs from your checklist, INCLUDING at least one edge/boundary case, and verify the OBSERVED OUTPUT is actually correct for each, not merely that the process exited 0.\n2. If the project ships tests (pytest, a tests/ directory), RUN them to completion and record the results.\n\nDecide the verdict HONESTLY. result is pass ONLY if the core requirements stated in .ai/clarified_spec.md demonstrably work end to end across the inputs you tried, including the edge case(s). If a required behavior is missing, errors, or produces the wrong result, result is fail with fault implementer and a concrete fix_request naming exactly what failed and in which file.\n\nThen create the directory .ai/validation/ and write .ai/validation/verdict.json with exactly these keys: result (pass or fail); fault (empty string if pass, else implementer meaning code/docs are wrong, plan meaning the plan asked for something infeasible, or harness meaning ONLY a missing package manager or a genuinely absent network); fix_request (empty string if pass or harness, else a concrete, code-actionable description of what must change and in which file); evidence (the REAL commands you ran with their actual output and exit codes, quoted not paraphrased). Back every value with what you actually observed. Write valid JSON. Then call report_outcome with status success once the verdict file is written (a written fail verdict is still a successful validation run)."
+  ];
+
+  // ---------- ReadVerdict: deterministic classify + bounded round counter -> val_state ----------
+  // Reads .ai/validation/verdict.json + .ai/validation/state.json (round, max_rounds). result=pass
+  // -> pass; fault=harness -> blocked (terminal: a genuine env gap, not looped); else round++ and
+  // val_state = exhausted (round > cap) | fix. Emits {"val_state": ...} as stdout JSON
+  // (parse_json) so context.val_state is set for CheckVal. Diagnostics to stderr; stdout is JSON only.
+  ReadVerdict [
+    shape=parallelogram, label="Read verdict",
+    parse_json="true",
+    tool_env="max_rounds",
+    tool_command="#!/bin/sh\nset -e\npython3 - <<'PYEOF'\nimport os, json, sys\nos.makedirs('.ai/validation', exist_ok=True)\nsp = '.ai/validation/state.json'\ncap = int(os.environ.get('MAX_ROUNDS', '') or '3')\nif os.path.exists(sp):\n    st = json.load(open(sp))\nelse:\n    st = dict(round=0, max_rounds=cap)\nst['max_rounds'] = cap\ntry:\n    d = json.load(open('.ai/validation/verdict.json'))\n    res = d.get('result', 'fail'); fault = d.get('fault', '')\nexcept Exception:\n    res = 'fail'; fault = 'implementer'\nif res == 'pass':\n    state = 'pass'\nelif fault == 'harness':\n    state = 'blocked'\nelse:\n    st['round'] += 1\n    state = 'exhausted' if st['round'] > cap else 'fix'\nst['last_val_state'] = state\njson.dump(st, open(sp, 'w'), indent=2)\nprint('[readverdict] result=%s fault=%s round=%d/%d -> %s' % (res, fault, st['round'], cap, state), file=sys.stderr)\nprint(json.dumps({'val_state': state}))\nPYEOF"
+  ];
+
+  // ---------- CheckVal: parent-owned routing on val_state ----------
+  CheckVal [shape=diamond, label="Build works?"];
+
+  // ---------- Reopen: append a fix task + INDEX line, then re-enter the Implement folder node ----
+  // implement_loop published re-entry API: append task + append INDEX line + re-invoke. Per the
+  // resumable-Init decision it does NOT reset .ai/impl_state.json -- implement_loop resumable Init
+  // re-arms the counter and recomputes remaining on re-entry, preserving prior .done markers +
+  // PROGRESS.md. stdout is an ok breadcrumb (nothing routes on Reopen; it flows straight to Implement).
+  Reopen [
+    shape=parallelogram, label="Reopen fix task",
+    tool_command="#!/bin/sh\nset -e\npython3 - <<'PYEOF'\nimport os, json, glob, re, sys\nnl = chr(10)\nplan = '.ai/plan'\ntry:\n    d = json.load(open('.ai/validation/verdict.json'))\nexcept Exception:\n    d = dict(fix_request='Validation failed but no verdict was written; investigate and fix.', fault='implementer', evidence='')\ntry:\n    rnd = json.load(open('.ai/validation/state.json'))['round']\nexcept Exception:\n    rnd = 1\nnums = []\nfor p in glob.glob(os.path.join(plan, 'task_*')):\n    m = re.match(r'task_(\d+)', os.path.basename(p))\n    if m:\n        nums.append(int(m.group(1)))\nnxt = (max(nums) + 1) if nums else 1\nfname = 'task_' + str(nxt).zfill(2) + '_fix_' + str(rnd) + '.md'\nfix_request = str(d.get('fix_request', '') or 'Address the validation failure described in the evidence.')\nevidence = d.get('evidence', '')\nif not isinstance(evidence, str):\n    evidence = json.dumps(evidence, indent=2)\nbody = ['# Fix task (validation round ' + str(rnd) + ')', '', 'Validation by using the build as a user FAILED. Fault: ' + str(d.get('fault', 'implementer')) + '.', '', '## What must change', fix_request, '', '## Evidence from the failed run', evidence, '', '## Acceptance', 'The documented usage AND the required behavior above succeed when the build is used as a new user would. If the fix adds a feature, add or update tests covering it and make them pass.']\nopen(os.path.join(plan, fname), 'w').write(nl.join(body) + nl)\nwith open(os.path.join(plan, 'INDEX.md'), 'a') as f:\n    f.write(nl + str(nxt).zfill(2) + '. ' + fname + ' - fix: ' + fix_request[:80] + nl)\nprint('[reopen] appended %s (round %d); NOT resetting impl_state -- resumable Init re-arms' % (fname, rnd), file=sys.stderr)\nprint('ok')\nPYEOF"
+  ];
+
+  // ============================================================================================
+  // STEP 6 -- REALITY-CHECK (isolated, in a fresh DTU via reality_check.dot as a folder node)
+  // ============================================================================================
+
+  // ---------- PrepareRC: set reality_check's params as PARENT CONTEXT KEYS (Resolve glue shed) --
+  // parse_json=true, so every key in the emitted stdout JSON becomes a BARE parent context key
+  // (tool.py:183-189 context.set(key,value)); the RC folder node's context.clone() then hands them
+  // to the child (DetectDUT reads $software_path/$acceptance_criteria; tool_env reads the UPPERCASE
+  // forms). NO /project/.resolve/config.json patch, NO gitea commit/push -- reality_check
+  // file-pushes the local workspace dir (no remote). software_path = the ABSOLUTE run cwd (the built
+  // workspace); acceptance_criteria = .ai/clarified_spec.md contents PLUS the extra hard RC
+  // requirement that drives the deterministic one-round fail (GET /items/{id}). Diagnostics to
+  // stderr; stdout is JSON only.
+  PrepareRC [
+    shape=parallelogram, label="Prepare reality check (params -> context)",
+    parse_json="true",
+    tool_command="#!/bin/sh\nset -e\npython3 - <<'PYEOF'\nimport os, json, sys\nNL = chr(10)\ntry:\n    spec = open('.ai/clarified_spec.md').read()\nexcept Exception as e:\n    print('ERROR: cannot read .ai/clarified_spec.md: %s' % e, file=sys.stderr)\n    sys.exit(1)\ncwd = os.getcwd()\n# acceptance_criteria = the ORIGINAL clarified intent PLUS an explicit extra RC requirement.\n# The extra requirement (GET /items/ID) is deliberately NOT in the build spec, so the round-1\n# build genuinely lacks it and the isolated RC catches it -- the honest one-round-fail trigger.\nextra = (NL + NL + '## Additional hard acceptance requirement (reality-check)' + NL\n         + 'In ADDITION to the endpoints above, the running service MUST support:' + NL\n         + '- GET /items/ID returns HTTP 200 with a JSON object having integer id and string name '\n         + 'for the item with that id (e.g. after creating an item, GET /items/1 returns exactly that '\n         + 'item, with the same id and name). A non-existent id returns HTTP 404.' + NL\n         + 'Concretely verify: create an item via POST /items, then GET /items/<that id> returns 200 '\n         + 'with the same id and name.' + NL)\ncriteria = spec.rstrip() + extra\nprint('[preparerc] software_path=%s ; acceptance_criteria=%d bytes (spec + RC extra req)' % (cwd, len(criteria)), file=sys.stderr)\nprint(json.dumps({'software_path': cwd, 'acceptance_criteria': criteria}))\nPYEOF"
+  ];
+
+  // ---------- RC: folder-node brick -> reality_check.dot (fresh DTU, file-push, probe) --------
+  // NO outputs= : reality_check writes .rc/verdict.json to the CALLER cwd, and folder nodes
+  // share that cwd filesystem -- so RCClassify reads the verdict FILE directly (exactly like
+  // ReadVerdict reads .ai/validation/verdict.json). Contrast Plan/Implement/Deliver, whose verdicts
+  // live only in the child's cloned CONTEXT and therefore DO need outputs=. The child inherits
+  // software_path/acceptance_criteria/sut_port from the parent context (set by PrepareRC).
+  RC [
+    shape=folder, label="Reality check (isolated DTU)",
+    dot_file="reality_check.dot"
+  ];
+
+  // ---------- RCClassify: deterministic classify + bounded rc-round counter -> rc_state ------------
+  // Reads .rc/verdict.json {verdict} + .ai/rc_fix_state.json {rc_rounds, max_rounds}. verdict=pass
+  // -> rc_pass; else rc_rounds++ and rc_state = rc_exhausted (over cap) | rc_fix. A missing/unreadable
+  // verdict counts as fail (bounded by the counter) -- never a silent pass. Emits {"rc_state": ...}
+  // as stdout JSON (parse_json) so context.rc_state is set for CheckRC. Diagnostics to stderr.
+  RCClassify [
+    shape=parallelogram, label="Classify RC verdict",
+    parse_json="true",
+    tool_env="rc_max_rounds",
+    tool_command="#!/bin/sh\nset -e\npython3 - <<'PYEOF'\nimport os, json, sys\nos.makedirs('.ai', exist_ok=True)\nsp = '.ai/rc_fix_state.json'\ncap = int(os.environ.get('RC_MAX_ROUNDS', '') or '2')\nif os.path.exists(sp):\n    st = json.load(open(sp))\nelse:\n    st = dict(rc_rounds=0, max_rounds=cap)\nst['max_rounds'] = cap\ntry:\n    verdict = json.load(open('.rc/verdict.json')).get('verdict') or 'fail'\nexcept Exception as e:\n    print('verdict.json unreadable: %s' % e, file=sys.stderr)\n    verdict = 'fail'\nif verdict == 'pass':\n    state = 'rc_pass'\nelse:\n    st['rc_rounds'] += 1\n    state = 'rc_exhausted' if st['rc_rounds'] > cap else 'rc_fix'\nst['last_rc_state'] = state\njson.dump(st, open(sp, 'w'), indent=2)\nprint('[rcclassify] verdict=%s round=%d/%d -> %s' % (verdict, st['rc_rounds'], cap, state), file=sys.stderr)\nprint(json.dumps({'rc_state': state}))\nPYEOF"
+  ];
+
+  // ---------- CheckRC: parent-owned routing on rc_state ----------
+  CheckRC [shape=diamond, label="Reality check passed?"];
+
+  // ---------- BuildRCFix: append an rcfix task + INDEX line, then re-enter the Implement folder node --
+  // Mirrors Reopen exactly, with the RC report embedded. Per the resumable-Init decision it does NOT
+  // reset .ai/impl_state.json -- implement_loop's resumable Init re-arms the counter + preserves prior
+  // .done markers / PROGRESS.md on re-entry. stdout is an ok breadcrumb (nothing routes on BuildRCFix;
+  // it flows straight into Implement via loop_restart).
+  BuildRCFix [
+    shape=parallelogram, label="Reopen RC fix task",
+    tool_command="#!/bin/sh\nset -e\npython3 - <<'PYEOF'\nimport os, json, glob, re, sys\nnl = chr(10)\nplan = '.ai/plan'\ntry:\n    v = json.load(open('.rc/verdict.json'))\n    verdict = v.get('verdict') or 'fail'\n    findings = v.get('findings', '')\nexcept Exception as e:\n    verdict = 'fail'; findings = 'verdict/report unreadable: ' + str(e)\nif not isinstance(findings, str):\n    findings = json.dumps(findings, indent=2)\ntry:\n    rnd = json.load(open('.ai/rc_fix_state.json'))['rc_rounds']\nexcept Exception:\n    rnd = 1\nnums = []\nfor p in glob.glob(os.path.join(plan, 'task_*')):\n    m = re.match(r'task_(\\d+)', os.path.basename(p))\n    if m:\n        nums.append(int(m.group(1)))\nnxt = (max(nums) + 1) if nums else 1\nfname = 'task_' + str(nxt).zfill(2) + '_rcfix_' + str(rnd) + '.md'\nbody = ['# Reality-check fix task (round ' + str(rnd) + ')', '', 'An INDEPENDENT reality check against the original spec returned verdict: ' + verdict + '.', 'Read the original intent in .ai/clarified_spec.md, then fix the build so it satisfies the failing acceptance below. Change code or docs in the workspace, never the tests.', '', '## Reality-check findings (from the isolated DTU probe)', findings[:6000], '', '## Acceptance', 'The reality check passes (the failing endpoint/behavior above now works) on the next run. If the fix adds an endpoint, add or update tests covering it and make them pass under python3 -m pytest.']\nopen(os.path.join(plan, fname), 'w').write(nl.join(body) + nl)\nwith open(os.path.join(plan, 'INDEX.md'), 'a') as f:\n    f.write(nl + str(nxt).zfill(2) + '. ' + fname + ' - reality-check fix round ' + str(rnd) + nl)\nprint('[buildrcfix] appended %s (round %d); NOT resetting impl_state -- resumable Init re-arms' % (fname, rnd), file=sys.stderr)\nprint('ok')\nPYEOF"
+  ];
+
+  // ---------- Deliver: folder-node brick -> README + delivery summary + local commit ----------
+  // Third proven brick. On all_done, hand the built workspace to deliver.dot, which writes a
+  // user-facing README.md + .ai/delivery_summary.md from the REAL validated commands recorded in
+  // .ai/plan/PROGRESS.md, then commits the workspace locally. Surfaces deliver.dot's terminal
+  // verdict as context.deliver_state via outputs="deliver_state" -- NOTHING in the spine routes on
+  // it (Deliver -> done unconditionally), but it is declared for folder-node consistency and
+  // observability, matching the plan_state/impl_state convention (same shape as dev_machine.dot
+  // SecurityReview outputs=). deliver.dot's Report node publishes {"deliver_state":"delivered"}.
+  Deliver [
+    shape=folder, label="Deliver",
+    dot_file="deliver.dot",
+    outputs="deliver_state"
+  ];
+
+  // ---------- Edges ----------
+  start -> Seed;
+  Seed  -> Plan;
+  Plan  -> CheckPlan;
+  // plan_ok -> hand the verified .ai/plan/ to the Implement brick; plan_failed -> stop (surfaced, not hidden)
+  CheckPlan -> Implement [condition="context.plan_state=plan_ok",     label="plan_ok"];
+  CheckPlan -> done      [condition="context.plan_state=plan_failed", label="plan_failed"];
+
+  Implement -> CheckImpl;
+  // all_done -> VALIDATE the build as a user BEFORE delivery; stalled/max_iter -> stop
+  // (partial, surfaced not hidden). NOTE: all_done now flows into UserRun (was Deliver).
+  CheckImpl -> UserRun [condition="context.impl_state=all_done", label="all_done"];
+  CheckImpl -> done    [condition="context.impl_state=stalled",  label="stalled"];
+  CheckImpl -> done    [condition="context.impl_state=max_iter", label="max_iter"];
+
+  // ---- Step 5 wiring (validate by using the build; fix loop RE-ENTERS the Implement folder node) ----
+  UserRun     -> ReadVerdict;
+  ReadVerdict -> CheckVal;
+  // pass -> proceed to Deliver; blocked/exhausted -> honest partial terminal (surfaced, not hidden);
+  // fix -> append a fix task, then RE-INVOKE the Implement folder node (the architecturally
+  // significant re-entry; resumable Init preserves prior markers, implements only the new task).
+  CheckVal -> PrepareRC [condition="context.val_state=pass",      label="pass"];
+  CheckVal -> done      [condition="context.val_state=blocked",   label="blocked"];
+  CheckVal -> done      [condition="context.val_state=exhausted", label="exhausted"];
+  CheckVal -> Reopen    [condition="context.val_state=fix",       label="fix"];
+  Reopen   -> Implement [loop_restart=true, label="re-implement"];
+
+  // ---- Step 6 wiring (isolated reality-check; fix loop RE-ENTERS the Implement folder node) ----
+  // PrepareRC sets software_path + acceptance_criteria as bare parent context keys; the RC folder
+  // node runs reality_check.dot in a fresh DTU (child inherits those keys via context.clone())
+  // and writes .rc/verdict.json to the shared cwd. RCClassify reads that FILE (no outputs= on RC) +
+  // the bounded rc-round counter -> rc_state.
+  PrepareRC  -> RC;
+  RC         -> RCClassify;
+  RCClassify -> CheckRC;
+  // rc_pass -> proceed to Deliver; rc_exhausted -> honest partial terminal (surfaced, not hidden);
+  // rc_fix -> append an rcfix task, then RE-INVOKE the Implement folder node (the second fix loop;
+  // resumable Init preserves prior markers, implements only the new rcfix task).
+  CheckRC -> Deliver    [condition="context.rc_state=rc_pass",      label="rc_pass"];
+  CheckRC -> done       [condition="context.rc_state=rc_exhausted", label="rc_exhausted"];
+  CheckRC -> BuildRCFix [condition="context.rc_state=rc_fix",       label="rc_fix"];
+  BuildRCFix -> Implement [loop_restart=true, label="rc-reimplement"];
+
+  // Deliver is a terminal success brick: nothing routes on deliver_state (it is surfaced only for
+  // observability); the built + delivered workspace flows unconditionally to done.
+  Deliver -> done;
+}

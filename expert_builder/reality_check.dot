@@ -1,0 +1,398 @@
+// reality_check.dot -- reality-check a SUT OUTSIDE Resolve, under plain dgr.
+//
+// WHY THIS EXISTS
+//   Resolve's reality_check.dot is platform-baked: it drives a reality-check SDK/broker
+//   through the reality_check_invoke handler and a fixed /opt/uv-tools/amplifier/bin/python
+//   runner, and reads /project/.resolve/config.json. It CANNOT run under dgr, and its runner
+//   is Python+Node only (no Go/Rust toolchains). This pipeline is the attractor-native contrast:
+//   the SAME detect -> launch -> deploy -> validate -> verdict -> teardown flow with ZERO
+//   broker/SDK, built only on the plain `amplifier-digital-twin` CLI (on PATH here) + two
+//   LLM agents (a dtu-profile-builder + a QA validator) + curl. Hold this up next to
+//   reality_check.dot to see that the ONLY real difference left is the broker/SDK coupling.
+//
+// DUT DETECTION (the fix): STAGE 1 now FIGURES OUT THE DUT with an LLM box node
+//   (DetectDUT) -- the broker-free equivalent of the `dtu-profile-builder` agent Resolve
+//   spawns through its SDK. It EXAMINES the SUT source and self-provisions the DETECTED
+//   toolchain (Rust -> rustup+cargo, Go -> golang, Node -> node, Python -> python, ...).
+//   NOTHING language-specific is hardcoded anywhere: Deploy just runs the script DetectDUT
+//   wrote. Same pipeline PASSES Go AND Rust with zero per-language branching.
+//
+// ONE pipeline, TWO clearly-separated stages (decompose later only if earned):
+//   STAGE 1 -- PREPARE DTU:  DETECT the DUT (toolchain/build/run/port), write a fitted DTU
+//                            profile + deploy script, launch the DTU, capture the handle.
+//   STAGE 2 -- RUN CHECK:    deploy the SUT into the DTU, exercise it, emit a pass/partial/fail verdict.
+//   plus TEARDOWN reachable from ALL terminal paths (success AND failure).
+//
+// FLOW
+//   Start -> DetectDUT -> LaunchDTU -> ParseHandle -> RouteHandle
+//   RouteHandle -> PushSUT            [launch_ok]
+//   RouteHandle -> TeardownFail       [launch_fail]
+//   PushSUT     -> Deploy
+//   Deploy      -> Validate           [deploy_ok]
+//   Deploy      -> SetFail            [deploy_fail]
+//   Validate    -> ReadVerdict
+//   ReadVerdict -> RenderPass         [pass]
+//   ReadVerdict -> RenderPartial      [partial]
+//   ReadVerdict -> SetFail            [fail]
+//   RenderPass    -> TeardownOK  -> Exit
+//   RenderPartial -> TeardownOK
+//   SetFail       -> TeardownFail
+//   TeardownFail  -> Failed
+//   19 nodes (ParseHandle split into ParseHandle + RouteHandle for BUG-2).
+//
+// PARAMS (dgr --param; delivered to tool nodes as UPPERCASE env via tool_env, and to the
+//         box/LLM nodes via $software_path / $acceptance_criteria / $sut_port non-dotted expansion):
+//   software_path        -- REQUIRED. A git URL (http/git@/ssh) OR a local directory holding the SUT.
+//   acceptance_criteria  -- REQUIRED. PROSE acceptance criteria (the QA agent reads this + curls).
+//                           Prose is the simplest form that genuinely verifies here: the Validate
+//                           node is an LLM QA agent that runs curl checks INSIDE the DTU via
+//                           `amplifier-digital-twin exec` -- exactly the proven dtu_validate.dot shape.
+//   sut_port             -- OPTIONAL. A HINT only. DetectDUT prefers the port it detects from the
+//                           source and writes to .rc/sut_port.txt; this param is the fallback if
+//                           detection cannot find one (then 8080). NO language-specific default.
+//   (deploy command is NOT a param anymore -- DetectDUT DETECTS build+run and writes .rc/deploy_cmd.sh.)
+//
+// ESCAPING / QUALITY DISCIPLINE (matches pipelines/publish_new_repo.dot):
+//   - Params reach tool nodes ONLY as UPPERCASE env vars (tool_env=) + shell-local vars.
+//     No ${lowercase.dotted} context braces anywhere -> the engine's $var expansion never
+//     mangles them, and we sidestep the dotted-key foot-guns entirely for tool nodes.
+//   - The TWO box/LLM nodes (DetectDUT, Validate) use only NON-DOTTED $-vars ($software_path,
+//     $sut_port, $dtu_container, $sut_base_url, $acceptance_criteria) -- dotted keys are silently
+//     dropped in box prompts (codergen filters
+//     `if "." not in k`), so we bridge via files (.rc/*, /tmp/rc_criteria.md) + non-dotted injected keys.
+//   - Deploy pushes DetectDUT's .rc/deploy_cmd.sh into the DTU and runs it as a FILE, so the
+//     worker shell never expands the script's $HOME/$(...)/loops -- they evaluate in the DTU.
+//   - Standalone pipeline -> single-\n escaping, \" for embedded quotes, #!/bin/sh scripts.
+//
+// CROSS-NODE HANDOFF (all under the run cwd; give it a stable --cwd):
+//   .rc/src.txt       -- resolved local SUT dir to push into the DTU         (DetectDUT -> PushSUT)
+//   .rc/profile.yaml  -- fitted DTU profile provisioning the DETECTED toolchain (DetectDUT -> LaunchDTU)
+//   .rc/deploy_cmd.sh -- DETECTED build+run+readiness script, run verbatim in the DTU (DetectDUT -> Deploy)
+//   .rc/sut_port.txt  -- DETECTED container-internal port                     (DetectDUT -> ParseHandle)
+//   .rc/handle.json   -- raw `amplifier-digital-twin launch` JSON (the DTU handle; LaunchDTU -> ParseHandle)
+//   .rc/name.txt      -- the DTU container name (scalar, extracted defensively)
+//   .rc/base_url.txt  -- the in-SUT base URL for validators (http://localhost:<detected port>)
+//   /tmp/rc_criteria.md, /tmp/rc_verdict.txt, /tmp/rc_feedback.txt -- verdict file-handoff (worker container)
+//
+// DTU launch JSON contract (confirmed against engine.py:launch return):
+//   Always: {id,name,profile,status,created_at,info}. `access` is a LIST of {label,url} and is
+//   OMITTED ENTIRELY when the profile forwards no ports -- so NEVER index access[0]; use
+//   .get("access", []) and guard length. We use `name`/`id` for the handle (always present) and
+//   derive the validator URL from the KNOWN container-internal port, not from access[].
+//
+// RUN -- STAGE 1 is an LLM now, so a --provider is REQUIRED (as it already was for Validate).
+//   The SAME command works for ANY language: DetectDUT figures out the toolchain. No per-language flags.
+//
+// RUN (Rust SUT -- SAME pipeline, zero per-language branching; DetectDUT provisions rustup+cargo):
+//   mkdir -p /tmp/rc && dgr run /home/robotdad/Resolve/dg-pipes/pipelines/reality_check.dot \
+//     --cwd /tmp/rc --provider anthropic \
+//     --param software_path=<git URL or local dir of the Rust SUT> \
+//     --param acceptance_criteria=\"GET /health returns 200 with JSON status ok. POST /items creates an item. GET /items lists items.\"
+//
+// RUN (Go items-API SUT, published repo):
+//   mkdir -p /tmp/rc && dgr run /home/robotdad/Resolve/dg-pipes/pipelines/reality_check.dot \
+//     --cwd /tmp/rc --provider anthropic \
+//     --param software_path=https://github.com/robotdad/ralph-go-itemsvc \
+//     --param acceptance_criteria="GET /health returns 200 with JSON status ok. POST /items with {\"name\":\"x\"} returns 201 and an item with an id. GET /items returns a JSON array including the created item."
+// RUN (Go items-API SUT, local dir):
+//   mkdir -p /tmp/rc && dgr run /home/robotdad/Resolve/dg-pipes/pipelines/reality_check.dot \
+//     --cwd /tmp/rc --provider anthropic \
+//     --param software_path=/home/robotdad/Resolve/dg-pipes/.work/dgr-runs/ralph_go/work \
+//     --param acceptance_criteria="GET /health returns 200 with JSON status ok. POST /items creates an item. GET /items lists items."
+
+digraph reality_check {
+  graph [
+    label="reality_check -- attractor-native reality-check (no broker, dgr-runnable)",
+    rankdir=LR,
+    default_max_retry="1",
+    default_fidelity="summary:medium"
+  ];
+
+  // ---------------------------------------------------------------------------
+  // Terminal nodes
+  // ---------------------------------------------------------------------------
+
+  Start  [shape=Mdiamond, label="Start"];
+  // Single exit node (engine requires exactly one). Pass/partial/fail is recorded in
+  // .rc/verdict.json — the terminal node's identity does NOT carry the verdict; every
+  // path (success AND failure) tears down the DTU and converges here.
+  Exit   [shape=Msquare,  label="Exit"];
+
+  // ===========================================================================
+  // STAGE 1 -- PREPARE DTU
+  // ===========================================================================
+
+  // ---------------------------------------------------------------------------
+  // DetectDUT -- the dtu-profile-builder ROLE, done LLM-native and broker-free.
+  // This is the whole reason STAGE 1 exists: FIGURE OUT THE DUT. It is a box/LLM
+  // agent with a bash tool (same capability the Validate box node already uses
+  // here to curl inside the DTU). It EXAMINES the SUT source on the HOST, DETECTS
+  // the language/toolchain/build/run/port for ANY language, and WRITES the three
+  // artifacts every downstream (deterministic) node consumes:
+  //
+  //   .rc/profile.yaml   -- a DTU profile whose provision.setup_cmds install the
+  //                         DETECTED toolchain (Rust -> rustup+cargo; Go -> golang;
+  //                         Node -> node/npm; Python -> python3+pip; ...). NOTHING
+  //                         language-specific is baked into the pipeline -- the
+  //                         agent writes whatever the SUT needs.
+  //   .rc/deploy_cmd.sh  -- the exact build+run+readiness shell the Deploy node
+  //                         runs VERBATIM inside the DTU. Deploy stays dumb plumbing.
+  //   .rc/sut_port.txt   -- the DETECTED container-internal port (validation reads it).
+  //   .rc/src.txt        -- the resolved local SUT dir PushSUT copies into the DTU.
+  //
+  // This is the true broker-free equivalent of Resolve's reality_check, which
+  // spawns the `dtu-profile-builder` agent through the SDK/broker to do exactly
+  // this detect-and-self-provision step. Here the SAME reasoning runs inline in a
+  // box node -- so the ONLY remaining difference from Resolve is the broker/SDK
+  // coupling, not the DUT detection.
+  //
+  // WHY host-side, before launch: we must inspect the real source (manifests such
+  // as go.mod / Cargo.toml / package.json / pyproject.toml) to decide the toolchain
+  // BEFORE we can write a fitted profile to launch. The agent clones the git URL or
+  // reads the local dir, then writes the artifacts. PushSUT later copies .rc/src
+  // (or the local dir) into the DTU, so both a git URL AND a local dir work uniformly.
+  //
+  // NO host port-forward is written into the profile: validators curl the SUT
+  // INSIDE the DTU via `exec` at localhost:<port>, so nothing needs to reach the
+  // SUT from the host -- and a host bind collides with occupied host ports.
+  //
+  // TOOLCHAIN-PATH FOOT-GUN (agent is told this explicitly): profile setup_cmds
+  // and the Deploy exec run in SEPARATE shells. A toolchain that installs into
+  // $HOME (rustup -> ~/.cargo, nvm, etc.) is NOT on PATH in the deploy shell unless
+  // deploy_cmd.sh re-sources it (e.g. `. "$HOME/.cargo/env"`) or uses absolute paths.
+  // The agent bakes that into deploy_cmd.sh so cargo/etc. are found at deploy time.
+  // ---------------------------------------------------------------------------
+
+  DetectDUT [
+    shape=box,
+    llm_model="claude-sonnet-4-6",
+    llm_provider="anthropic",
+    label="Detect DUT + build profile (agent)",
+    max_agent_turns="30",
+    timeout="900s",
+    prompt="You are a dtu-profile-builder agent. Your job is to FIGURE OUT THE DUT (Device/Software Under Test) for a reality-check, with ZERO per-language assumptions. Detect the toolchain from the actual source and self-provision it -- Go, Rust, Node, Python, or anything else. Use your bash tool for every step; do not just describe, DO it.\n\nSOFTWARE_PATH (a git URL OR a local directory holding the SUT):\n$software_path\n\nPORT HINT (may be empty -- prefer what the source actually uses):\n$sut_port\n\nAll paths below are relative to your current working directory (the run cwd). Create .rc/ if needed: `mkdir -p .rc`.\n\nSTEP 1 -- RESOLVE THE SOURCE onto the host so you can read it:\n  If $software_path looks like a git URL (starts with http, git@, or ssh://):\n    rm -rf .rc/src && git clone --depth 1 \"$software_path\" .rc/src\n    printf '%s' .rc/src > .rc/src.txt\n  Otherwise it is a local dir -- confirm it exists and record it verbatim:\n    test -d \"$software_path\" && printf '%s' \"$software_path\" > .rc/src.txt\n  Let SRC be the contents of .rc/src.txt from here on.\n\nSTEP 2 -- EXAMINE THE SOURCE and DETECT the DUT. List files and read manifests to decide language, toolchain, build command, run command, and the port the service listens on. Look for (non-exhaustive):\n  - Rust:   Cargo.toml (note the `edition`, e.g. 2021/2024), src/main.rs\n  - Go:     go.mod (may be nested in a subdir), *.go, main package\n  - Node:   package.json (scripts.start / scripts.build), server.js\n  - Python: pyproject.toml / requirements.txt / *.py, an app entrypoint\n  - anything else: infer from the files present.\n  Detect the LISTEN PORT from the code/config (env default, hardcoded bind, README). If truly undiscoverable, fall back to the PORT HINT above, else 8080.\n\nSTEP 3 -- WRITE .rc/sut_port.txt : the single detected port number, no newline noise. Example: `printf '%s' 8080 > .rc/sut_port.txt`\n\nSTEP 4 -- WRITE .rc/profile.yaml : a DTU profile whose provision.setup_cmds install the DETECTED toolchain (NOT a hardcoded one). Requirements:\n  - base.image: ubuntu:24.04\n  - passthrough allow_external: true, with an anthropic service keyed on ANTHROPIC_API_KEY (so the QA validator's own tools work).\n  - provision.setup_cmds: a YAML list of shell strings that (a) apt-get install the common basics you need (git curl ca-certificates build-essential) and (b) install the toolchain YOU detected. Do NOT bake a toolchain the SUT does not use.\n  - Include `mkdir -p /sut` so PushSUT has a target.\n  - Do NOT add any access: ports / host port-forward (validation is in-DTU via exec).\n  Example setup_cmds lines by detected toolchain (adapt, do not blindly copy):\n    Go:     `apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates golang-go && rm -rf /var/lib/apt/lists/*`\n    Rust:   `apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates build-essential && rm -rf /var/lib/apt/lists/*`  then  `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y`\n    Node:   `apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates nodejs npm && rm -rf /var/lib/apt/lists/*`\n    Python: `apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates python3 python3-pip python3-venv && rm -rf /var/lib/apt/lists/*`\n  A valid profile shape (fill in setup_cmds from YOUR detection):\n    name: rc-local-sut\n    description: Reality-check DTU, toolchain detected by dtu-profile-builder.\n    base:\n      image: ubuntu:24.04\n    passthrough:\n      allow_external: true\n      services:\n      - name: anthropic\n        key_env: ANTHROPIC_API_KEY\n    provision:\n      setup_cmds:\n      - <toolchain install line(s) you detected>\n      - mkdir -p /sut\n  Write it EXACTLY as valid YAML (spaces, not tabs). Verify with: `python3 -c \\\"import yaml,sys; yaml.safe_load(open('.rc/profile.yaml'))\\\"` and fix any error before moving on.\n\nSTEP 5 -- WRITE .rc/deploy_cmd.sh : the exact shell the Deploy node will run VERBATIM inside the DTU (as `bash -lc`) to BUILD and RUN the SUT, then confirm readiness. The pushed source lands under /sut. Requirements:\n  - Locate the project root under /sut (it may be nested, e.g. /sut/<subdir>; find the manifest you detected -- go.mod / Cargo.toml / package.json / pyproject.toml). Do not assume it is exactly /sut.\n  - If the toolchain installed into $HOME (rustup -> ~/.cargo, nvm, etc.), SOURCE it first so the tools are on PATH in this fresh shell: e.g. `. \\\"$HOME/.cargo/env\\\"` for Rust, or use absolute paths like `$HOME/.cargo/bin/cargo`.\n  - Build with the DETECTED command (`cargo build --release`, `go build -o /tmp/sut .`, `npm ci && npm run build` if present, `pip install -r requirements.txt`, etc.).\n  - Start the SUT DETACHED so exec returns: `nohup <run cmd> >/tmp/sut.log 2>&1 &` where <run cmd> binds the detected port (e.g. the release binary, `go run` output, `node server.js`, `python3 app.py`). Ensure the process binds 0.0.0.0 or localhost on the detected port.\n  - Then a readiness loop: `for i in $(seq 1 30); do sleep 1; curl -fsS http://localhost:<PORT>/health && exit 0; done; curl -fsS http://localhost:<PORT>/ && exit 0; exit 1` -- adapt the readiness path to something the SUT actually serves (fall back to `/` if there is no /health). The script's FINAL exit code MUST be 0 iff the SUT is up and answering.\n  - Make it start with `#!/usr/bin/env bash` and `set -e` is OPTIONAL (a failing readiness curl in a loop must not abort early -- structure it so the loop can retry).\n  Write it with a heredoc, then `chmod +x .rc/deploy_cmd.sh` and syntax-check it with `bash -n .rc/deploy_cmd.sh` and fix any error.\n\nSTEP 6 -- VERIFY your artifacts exist and are non-empty as your final action:\n  `ls -l .rc/profile.yaml .rc/deploy_cmd.sh .rc/sut_port.txt .rc/src.txt` and print the detected language + port so the run log shows what you decided.\n\nMANDATORY: all four files (.rc/profile.yaml, .rc/deploy_cmd.sh, .rc/sut_port.txt, .rc/src.txt) MUST exist and be valid before you stop. If you cannot resolve the source or detect a toolchain, still write the files with your best inference -- the downstream nodes have no fallback and will fail loudly if these are missing. Do not hardcode a toolchain the SUT does not use."
+  ];
+
+  // ---------------------------------------------------------------------------
+  // LaunchDTU -- launch the profile. Captures the FULL launch JSON to
+  // .rc/handle.json (stdout = the JSON envelope; progress noise is on stderr).
+  // Echoes launch_ok / launch_fail on the last stdout line for routing.
+  //
+  // Uses a unique name so repeat runs don't collide. continue_on_fail lets the
+  // pipeline route to teardown on a launch failure instead of dying mid-graph.
+  // ---------------------------------------------------------------------------
+
+  LaunchDTU [
+    shape=parallelogram,
+    label="Launch DTU",
+    continue_on_fail="true",
+    tool_command="#!/bin/sh\nset -e\nmkdir -p .rc\nNAME=\"rc-local-$(date +%s)\"\nif amplifier-digital-twin launch .rc/profile.yaml --name \"$NAME\" > .rc/handle.json 2> .rc/launch.err; then\n  echo \"$NAME\" > .rc/name.txt\n  echo \"launched $NAME\" 1>&2\n  printf launch_ok\nelse\n  cat .rc/launch.err 1>&2\n  echo \"\" > .rc/name.txt\n  printf launch_fail\nfi"
+  ];
+
+  // ---------------------------------------------------------------------------
+  // ParseHandle -- STAGE 1 output contract. Reads .rc/handle.json DEFENSIVELY
+  // (never access[0] on an absent/empty list), writes the scalar handle keys to
+  // files, and emits PURE NON-DOTTED JSON (nothing else on stdout) so parse_json
+  // injects prompt-usable keys:
+  //   dtu_container -- the DTU name/id  (non-dotted; safe in box prompts)
+  //   sut_base_url  -- in-SUT validator base URL (http://localhost:<port>)
+  //
+  // BUG-2 FIX: a parse_json node must emit ONLY JSON on stdout. It CANNOT also
+  // print a trailing routing token -- parse_json would try to parse the whole
+  // stdout (JSON + token) and FAIL, so dtu_container/sut_base_url would never be
+  // injected. The routing decision (launch_ok/launch_fail) is delegated to a
+  // SEPARATE node (RouteHandle) that reads .rc/parse_status.txt and emits the
+  // token as its last stdout line. Keeps the defensive access[] handling here.
+  // ---------------------------------------------------------------------------
+
+  ParseHandle [
+    shape=parallelogram,
+    label="Parse DTU Handle",
+    parse_json="true",
+    tool_env="sut_port",
+    tool_command="#!/bin/sh\nset -e\n# Prefer the DETECTED port DetectDUT wrote; fall back to the --param, then 8080.\nPORT=\"$(cat .rc/sut_port.txt 2>/dev/null | tr -d '[:space:]')\"\n[ -n \"$PORT\" ] || PORT=\"$SUT_PORT\"\n[ -n \"$PORT\" ] || PORT=8080\npython3 - \"$PORT\" <<'PYEOF'\nimport json, pathlib, sys\nport = sys.argv[1]\nh = pathlib.Path('.rc/handle.json')\nname = ''\ntry:\n    data = json.loads(h.read_text()) if h.exists() else {}\n    # 'name'/'id' are ALWAYS present on a successful launch; 'access' may be\n    # absent entirely. Never index access[0]; derive the URL from the known port.\n    name = data.get('name') or data.get('id') or ''\n    access = data.get('access', [])\n    if not isinstance(access, list):\n        access = []\nexcept Exception as e:\n    print('handle parse error: %s' % e, file=sys.stderr)\nbase_url = 'http://localhost:%s' % port\npathlib.Path('.rc/name.txt').write_text(name)\npathlib.Path('.rc/base_url.txt').write_text(base_url)\nstatus = 'launch_ok' if name else 'launch_fail'\npathlib.Path('.rc/parse_status.txt').write_text(status)\n# STDOUT MUST BE PURE JSON for parse_json -- routing is done by RouteHandle.\nprint(json.dumps({'dtu_container': name, 'sut_base_url': base_url}))\nPYEOF"
+  ];
+
+  // ---------------------------------------------------------------------------
+  // RouteHandle -- BUG-2 FIX. Pure routing node (NO parse_json). Reads the status
+  // ParseHandle wrote to .rc/parse_status.txt and echoes launch_ok / launch_fail
+  // as its last stdout line (sets context.tool.last_line) for the routing edges.
+  // Separating this from ParseHandle is what lets ParseHandle emit pure JSON.
+  // ---------------------------------------------------------------------------
+
+  RouteHandle [
+    shape=parallelogram,
+    label="Route on DTU Handle",
+    tool_command="#!/bin/sh\ns=$(cat .rc/parse_status.txt 2>/dev/null | tr -d '[:space:]')\ncase \"$s\" in launch_ok) echo launch_ok;; *) echo launch_fail;; esac"
+  ];
+
+  // ===========================================================================
+  // STAGE 2 -- RUN REALITY CHECK against the prepared DTU
+  // ===========================================================================
+
+  // ---------------------------------------------------------------------------
+  // PushSUT -- copy the resolved local SUT dir into the DTU at /sut. This is the
+  // standalone stand-in for Resolve's workspace bind-mount (a fresh DTU has no
+  // mount). Recursive push; overwrites /sut contents. Echoes push_ok/push_fail.
+  // ---------------------------------------------------------------------------
+
+  PushSUT [
+    shape=parallelogram,
+    label="Push SUT into DTU",
+    continue_on_fail="true",
+    tool_command="#!/bin/sh\nset -e\nNAME=\"$(cat .rc/name.txt 2>/dev/null)\"\nSRC=\"$(cat .rc/src.txt 2>/dev/null)\"\n[ -n \"$NAME\" ] || { echo no-dtu 1>&2; printf push_fail; exit 0; }\n[ -d \"$SRC\" ] || { echo \"src missing: $SRC\" 1>&2; printf push_fail; exit 0; }\nif amplifier-digital-twin file-push -r -p \"$NAME\" \"$SRC/.\" /sut/ 1>&2; then\n  printf push_ok\nelse\n  printf push_fail\nfi"
+  ];
+
+  // ---------------------------------------------------------------------------
+  // Deploy -- build+run the SUT INSIDE the DTU and route on the INNER exit code.
+  //
+  // THE EXIT-CODE PROBLEM (same as dtu_validate.dot): `exec` always exits 0; the
+  // real exit code is inside the JSON envelope {"exit_code":N,...}. We capture the
+  // envelope and grep exit_code out (no jq needed).
+  //
+  // Deploy is now DUMB PLUMBING: it runs the AGENT-DETECTED build/run script
+  // (.rc/deploy_cmd.sh, written by DetectDUT) VERBATIM inside the DTU. There is
+  // ZERO per-language logic here -- no `go build`, no go.mod-find, no toolchain
+  // default. Whatever language DetectDUT found, that script builds+runs it.
+  //
+  // NO-FALLBACK (fail loud): if .rc/deploy_cmd.sh is missing, that means STAGE 1
+  // detection did not happen -- we FAIL rather than silently defaulting to some
+  // language. That is the whole point of ripping out the hardcoding.
+  //
+  // ESCAPING (why this is now simple): instead of assembling a deploy string in
+  // the worker shell (which forced fragile \\$ escaping so $(...)/$HOME/$i would
+  // survive to the DTU), we PUSH the agent's script file into the DTU and run it
+  // as a FILE. Everything inside deploy_cmd.sh -- $HOME, $(find ...), the readiness
+  // loop -- evaluates INSIDE the DTU because the worker shell never expands a file's
+  // contents. The worker shell only substitutes $NAME (worker-local). This also lets
+  // deploy_cmd.sh re-source a $HOME toolchain (e.g. `. \"$HOME/.cargo/env\"`) so a
+  // Rust/Node toolchain installed by setup_cmds is on PATH at deploy time.
+  //
+  // THE EXIT-CODE PROBLEM (same as dtu_validate.dot): `exec` always exits 0; the
+  // real exit code is inside the JSON envelope {\"exit_code\":N,...}. We capture the
+  // envelope and grep exit_code out (no jq needed). deploy_cmd.sh's own final exit
+  // code (0 iff the SUT is up) is what lands in that envelope.
+  // ---------------------------------------------------------------------------
+
+  Deploy [
+    shape=parallelogram,
+    label="Deploy SUT in DTU",
+    tool_command="#!/bin/sh\nset -e\nNAME=\"$(cat .rc/name.txt 2>/dev/null)\"\n[ -n \"$NAME\" ] || { echo no-dtu 1>&2; printf deploy_fail; exit 0; }\nif [ ! -s .rc/deploy_cmd.sh ]; then\n  echo 'no .rc/deploy_cmd.sh -- STAGE 1 detection did not produce a deploy command' 1>&2\n  printf 'Deploy failed: DetectDUT produced no deploy_cmd.sh (no toolchain detected).\\n' > /tmp/rc_feedback.txt\n  printf deploy_fail\n  exit 0\nfi\n# Push the agent-detected build/run script into the DTU and run it as a FILE so\n# nothing in it is expanded by the worker shell.\namplifier-digital-twin file-push -p \"$NAME\" .rc/deploy_cmd.sh /tmp/rc_deploy.sh 1>&2 || { echo 'push deploy_cmd.sh failed' 1>&2; printf deploy_fail; exit 0; }\nOUT=\"$(amplifier-digital-twin exec \"$NAME\" -- bash -lc 'chmod +x /tmp/rc_deploy.sh; bash /tmp/rc_deploy.sh' 2>/tmp/rc_exec.err || true)\"\nCODE=\"$(printf '%s' \"$OUT\" | grep -o '\"exit_code\"[^,}]*' | grep -o '[0-9][0-9]*' | head -1)\"\nprintf '%s' \"$OUT\" 1>&2\ncat /tmp/rc_exec.err 1>&2 || true\nif [ \"$CODE\" = \"0\" ]; then\n  printf deploy_ok\nelse\n  printf 'Deploy failed (exit %s). Output above.\\n' \"${CODE:-unknown}\" > /tmp/rc_feedback.txt\n  printf deploy_fail\nfi"
+  ];
+
+  // ---------------------------------------------------------------------------
+  // Validate -- QA agent (the ONE box/LLM node). Reads prose criteria from
+  // /tmp/rc_criteria.md, exercises the SUT via `amplifier-digital-twin exec
+  // $dtu_container -- curl ...` against $sut_base_url (in-SUT localhost:$port),
+  // then writes the verdict + feedback to the WORKER container:
+  //   /tmp/rc_verdict.txt  -- exactly one of: pass | partial | fail
+  //   /tmp/rc_feedback.txt -- human-readable findings
+  //
+  // Uses ONLY non-dotted vars ($dtu_container, $sut_base_url, $acceptance_criteria)
+  // -- injected by ParseHandle (parse_json) + dgr --param expansion. A prose QA
+  // agent + curl is the simplest validator that genuinely verifies open-ended
+  // criteria; a pure deterministic curl node can't judge arbitrary prose contracts.
+  //
+  // First action writes the criteria file so the agent (and a re-run) can read it.
+  // ---------------------------------------------------------------------------
+
+  Validate [
+    shape=box,
+    llm_model="claude-sonnet-4-6",
+    llm_provider="anthropic",
+    label="Validate (QA agent)",
+    max_agent_turns="20",
+    timeout="600s",
+    prompt="You are a QA reality-check agent. A System-Under-Test (SUT) is deployed and running inside a DTU container. Verify it against acceptance criteria and emit a verdict.\n\nCONTAINER: $dtu_container\nSUT BASE URL (inside the container): $sut_base_url\n\nACCEPTANCE CRITERIA:\n$acceptance_criteria\n\nSTEP 1 -- Persist the criteria so it survives (use your bash tool):\n  cat > /tmp/rc_criteria.md <<'EOF'\n$acceptance_criteria\nEOF\n\nSTEP 2 -- Exercise the SUT. Run each check by executing curl INSIDE the container:\n  amplifier-digital-twin exec $dtu_container -- curl -fsS -X GET $sut_base_url/health\n  amplifier-digital-twin exec $dtu_container -- curl -fsS -X POST $sut_base_url/items -H 'Content-Type: application/json' -d '{\"name\":\"probe\"}'\n  amplifier-digital-twin exec $dtu_container -- curl -fsS -X GET $sut_base_url/items\nAdapt the exact endpoints/methods/payloads to what the ACCEPTANCE CRITERIA describe. Record each check as PASS or FAIL with the observed status and body.\n\nSTEP 3 -- Decide a verdict:\n  pass    -- every criterion verified\n  partial -- the SUT is up and some criteria pass but at least one fails\n  fail    -- the SUT is unreachable or no criteria pass\n\nSTEP 4 (REQUIRED, do these as your FINAL actions with your bash tool, in the WORKER container -- NOT via exec):\n  printf '%s' pass > /tmp/rc_verdict.txt   (or partial, or fail -- exactly one word, no newline noise)\n  cat > /tmp/rc_feedback.txt <<'EOF'\n<one line per criterion: PASS/FAIL + the observed status/body>\nEOF\n\nMANDATORY: /tmp/rc_verdict.txt MUST be written before you stop -- if absent, the pipeline treats it as fail. Write both files as your last actions. Do not just print prose and stop."
+  ];
+
+  // ---------------------------------------------------------------------------
+  // ReadVerdict -- reads /tmp/rc_verdict.txt, normalises, echoes exactly one of
+  // pass|partial|fail as the last stdout line (sets context.tool.last_line).
+  // Anything absent/unexpected -> fail (a missing verdict is a structural FAIL,
+  // never a silent pass). Proven pattern: dtu_validate.dot ReadVerdict.
+  // ---------------------------------------------------------------------------
+
+  ReadVerdict [
+    shape=parallelogram,
+    label="Read Verdict",
+    tool_command="#!/bin/sh\nv=$(cat /tmp/rc_verdict.txt 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')\ncase \"$v\" in pass) echo pass;; partial) echo partial;; fail) echo fail;; *) echo fail;; esac"
+  ];
+
+  // ---------------------------------------------------------------------------
+  // RenderPass / RenderPartial / SetFail -- render a structured verdict summary
+  // to .rc/verdict.json (the pipeline's OUTPUT ARTIFACT) and to stdout. Each
+  // reads /tmp/rc_feedback.txt for the human-readable findings. SetFail also
+  // covers the deploy_fail short-circuit (skips validation entirely).
+  // ---------------------------------------------------------------------------
+
+  RenderPass [
+    shape=parallelogram,
+    label="Render Verdict: PASS",
+    tool_command="#!/bin/sh\nset -e\nmkdir -p .rc\nNAME=\"$(cat .rc/name.txt 2>/dev/null)\"\nFB=\"$(cat /tmp/rc_feedback.txt 2>/dev/null | head -c 1200 | tr -d '\"' | tr '\\n' ' ' || true)\"\nprintf '{\"verdict\": \"pass\", \"dtu\": \"%s\", \"findings\": \"%s\"}\\n' \"$NAME\" \"$FB\" | tee .rc/verdict.json\necho \"REALITY CHECK: PASS\" 1>&2\nprintf verdict_pass"
+  ];
+
+  RenderPartial [
+    shape=parallelogram,
+    label="Render Verdict: PARTIAL",
+    tool_command="#!/bin/sh\nset -e\nmkdir -p .rc\nNAME=\"$(cat .rc/name.txt 2>/dev/null)\"\nFB=\"$(cat /tmp/rc_feedback.txt 2>/dev/null | head -c 1200 | tr -d '\"' | tr '\\n' ' ' || true)\"\nprintf '{\"verdict\": \"partial\", \"dtu\": \"%s\", \"findings\": \"%s\"}\\n' \"$NAME\" \"$FB\" | tee .rc/verdict.json\necho \"REALITY CHECK: PARTIAL\" 1>&2\nprintf verdict_partial"
+  ];
+
+  SetFail [
+    shape=parallelogram,
+    label="Render Verdict: FAIL",
+    tool_command="#!/bin/sh\nset -e\nmkdir -p .rc\nNAME=\"$(cat .rc/name.txt 2>/dev/null)\"\nFB=\"$(cat /tmp/rc_feedback.txt 2>/dev/null | head -c 1200 | tr -d '\"' | tr '\\n' ' ' || echo 'reality check failed')\"\nprintf '{\"verdict\": \"fail\", \"dtu\": \"%s\", \"findings\": \"%s\"}\\n' \"$NAME\" \"$FB\" | tee .rc/verdict.json\necho \"REALITY CHECK: FAIL\" 1>&2\nprintf verdict_fail"
+  ];
+
+  // ===========================================================================
+  // TEARDOWN -- reachable from ALL terminal paths (resolve_validated.dot FIX 4).
+  //   TeardownOK   -- success/partial path -> Exit
+  //   TeardownFail -- failure path (launch/deploy/validate fail) -> Failed
+  // Both continue_on_fail=true: destroy runs even if the container is already
+  // gone. Read the name from .rc/name.txt so teardown works regardless of which
+  // upstream node last ran. NO terminal path bypasses a teardown -> no orphans.
+  // ===========================================================================
+
+  TeardownOK [
+    shape=parallelogram,
+    label="Teardown DTU (ok)",
+    continue_on_fail="true",
+    tool_command="#!/bin/sh\nNAME=\"$(cat .rc/name.txt 2>/dev/null)\"\nif [ -n \"$NAME\" ]; then amplifier-digital-twin destroy \"$NAME\" 1>&2 && echo \"destroyed $NAME\" 1>&2; else echo \"no DTU to destroy\" 1>&2; fi\nprintf torn_down"
+  ];
+
+  TeardownFail [
+    shape=parallelogram,
+    label="Teardown DTU (fail)",
+    continue_on_fail="true",
+    tool_command="#!/bin/sh\nNAME=\"$(cat .rc/name.txt 2>/dev/null)\"\nif [ -n \"$NAME\" ]; then amplifier-digital-twin destroy \"$NAME\" 1>&2 && echo \"destroyed $NAME\" 1>&2; else echo \"no DTU to destroy\" 1>&2; fi\nprintf torn_down"
+  ];
+
+  // ---------------------------------------------------------------------------
+  // Edges
+  // ---------------------------------------------------------------------------
+
+  // STAGE 1: prepare
+  Start        -> DetectDUT;
+  DetectDUT    -> LaunchDTU;
+  LaunchDTU    -> ParseHandle;
+  ParseHandle  -> RouteHandle;
+  RouteHandle  -> PushSUT      [condition="context.tool.last_line=launch_ok",  label="launched"];
+  RouteHandle  -> TeardownFail [condition="context.tool.last_line=launch_fail", label="launch failed"];
+
+  // STAGE 2: run check
+  PushSUT  -> Deploy;
+  Deploy   -> Validate [condition="context.tool.last_line=deploy_ok",   label="deployed"];
+  Deploy   -> SetFail  [condition="context.tool.last_line=deploy_fail", label="deploy failed"];
+  Validate -> ReadVerdict;
+  ReadVerdict -> RenderPass    [condition="context.tool.last_line=pass",    label="pass"];
+  ReadVerdict -> RenderPartial [condition="context.tool.last_line=partial", label="partial"];
+  ReadVerdict -> SetFail       [condition="context.tool.last_line=fail",    label="fail"];
+
+  // Teardown from ALL terminal paths (no orphaned DTUs).
+  RenderPass    -> TeardownOK;
+  RenderPartial -> TeardownOK;
+  TeardownOK    -> Exit;
+
+  SetFail       -> TeardownFail;
+  TeardownFail  -> Exit;
+}

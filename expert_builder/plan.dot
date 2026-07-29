@@ -1,0 +1,116 @@
+// plan.dot -- the PRODUCER brick of the decomposed, DTU-first expert_builder.
+//
+// WHAT IT IS
+//   Turns a clarified spec (plus OPTIONAL spikes) into the .ai/plan/ directory that
+//   implement_loop.dot consumes. Extracted from expert_builder.dot Step 3
+//   (Plan -> VerifyPlan -> CheckPlan), fixed to the [[eb-plan-contract]] published
+//   interface. The coupling in one line: plan's OUTPUTS are exactly implement_loop's
+//   INPUT preconditions -- so this brick's whole job is to guarantee that shape,
+//   verified deterministically on disk before handoff.
+//
+// THE STUD (filesystem contract on .ai/plan/, relative to cwd):
+//   INPUTS  (caller preconditions):
+//     .ai/clarified_spec.md          -- REQUIRED: what to build + what "done" means
+//     .ai/pieces/INDEX.md            -- OPTIONAL: summary of explored hard parts (spikes)
+//     .ai/hard_parts/slot_*/...      -- OPTIONAL: spiked proof-of-concept code to reuse
+//     cwd is a workspace (ideally a git repo)
+//   OUTPUTS (postconditions on plan_ok):
+//     .ai/plan/INDEX.md              -- ordered task manifest; a "## Reuse decisions"
+//                                       section ONLY if spikes were present
+//     .ai/plan/task_NN_<slug>.md     -- >=1 self-contained task each: goal, exact files,
+//                                       interface/contract, reuse-or-build-fresh, acceptance
+//     .ai/plan_state.json            -- verify/retry state (retries, last_routing)
+//   ROUTING SIGNAL: plan_state in {plan_ok | plan_missing | plan_failed}
+//
+// SPIKES ARE OPTIONAL
+//   If .ai/hard_parts/ exists, Plan folds REUSE decisions in (and INDEX gets a
+//   "## Reuse decisions" section). If not, it plans from the spec ALONE -- no Reuse
+//   section. This makes plan.dot usable standalone for simple builds; compose
+//   decompose_spike in front only when a build is hard enough to warrant spiking.
+//
+// SELF-VERIFY GATE (deterministic, before handoff)
+//   Plan does NOT trust the agent's "I wrote the plan" self-report. VerifyPlan confirms
+//   artifacts on disk: INDEX.md exists AND non-empty AND len(glob .ai/plan/task_*) >= 1
+//   -> plan_ok, else plan_missing. CheckPlan routes plan_ok -> Exit (hand to implement),
+//   plan_missing -> retry Plan, with a BOUNDED retry cap (MAX_RETRIES, default 2) after
+//   which it exits plan_failed rather than looping forever.
+//
+// RESOLVED DECISIONS (from [[eb-plan-contract]])
+//   1. Stable spec source: Plan reads .ai/clarified_spec.md directly. No clarify gate baked
+//      in (a Seed/clarify brick composes in front to populate it in headless DTU runs).
+//   2. Spikes OPTIONAL (above).
+//   3. Pre-build human-approval gate DROPPED from core (headless DTU-first). No CONCERNS.md
+//      approval detour; if wanted, compose an approval-gate brick in front.
+//
+// ESCAPING (why this looks the way it does -- matches proven implement_loop.dot / reality_check.dot)
+//   - This file is run by dgr directly AND (later) loaded as a shape=folder subgraph inside
+//     expert_builder.dot. In the file+subgraph path, tool_command uses SINGLE \n as the
+//     line separator (NOT the \\n of the resolver's dot_content path) and each shell body is
+//     a Python heredoc for all JSON/glob I/O -- escape-path robust.
+//   - chr(10) is used for literal newlines in Python (NOT '\n', which DOT _parse_value would
+//     corrupt into a real newline mid-token).
+//   - Params reach tool nodes ONLY as UPPERCASE env vars via tool_env= (no shell interpolation
+//     of arbitrary text). Diagnostics go to stderr; the routing label is the LAST stdout line
+//     (sets context.tool.last_line). Retry back-edge uses loop_restart=true (UNQUOTED).
+//
+// PARAMS (dgr --param k=v):
+//   max_retries -- MAX_RETRIES env (default 2). Cap on Plan re-attempts before plan_failed.
+//   (plan model is a hardcoded knob below: claude-sonnet-4-5. llm_model attributes cannot
+//    reference env vars; override by forking this DOT. The original used opus; sonnet is the
+//    cheaper local default, matching implement_loop.)
+
+digraph plan {
+  graph [
+    label="Plan -- clarified spec (+ optional spikes) -> .ai/plan/",
+    goal="Emit an ordered .ai/plan/ (INDEX.md + >=1 task_NN_*.md) whose shape satisfies implement_loop's input contract, verified on disk.",
+    rankdir="LR",
+    default_max_retry="1",
+    default_fidelity="truncate"
+  ];
+
+  Start [shape=Mdiamond, label="Start"];
+  Exit  [shape=Msquare,  label="Exit"];
+
+  // ---------- Plan: LLM agent writes the ordered plan ----------
+  // goal_gate + fidelity=full: full context to reason over the spec (+ spikes) and emit a
+  // self-contained plan. Prompt reused from expert_builder Step 3, FIXED per the contract:
+  // spikes are OPTIONAL (Reuse section only if hard_parts exists), no CONCERNS.md approval
+  // detour. Writes INDEX.md LAST so it reflects the final task breakdown.
+  Plan [
+    shape=box, label="Build implementation plan",
+    goal_gate="true",
+    fidelity="full",
+    llm_provider="anthropic", llm_model="claude-sonnet-4-5",
+    max_agent_turns="80", timeout="1800s",
+    prompt="You are writing a detailed implementation plan that a later stage will execute task-by-task, one task per clean-context iteration. A good plan is concrete enough that a coder can follow it WITHOUT re-deciding the architecture. All paths are relative to your current working directory.\n\nREAD these inputs:\n- .ai/clarified_spec.md (REQUIRED): what to build and what 'done' means. This always exists; read it first.\n- .ai/pieces/INDEX.md (OPTIONAL): a summary of explored hard parts, IF it exists.\n- .ai/hard_parts/slot_*/SOLUTION.md and the spiked proof-of-concept code under .ai/hard_parts/slot_*/approach_* (each may have a NOTES.md), IF that directory exists. This is real code you MAY reuse.\n\nFirst check whether .ai/hard_parts/ exists (for example: list the directory). This decides whether spikes are in play:\n- IF .ai/hard_parts/ EXISTS: for EACH spiked piece, decide REUSE (copy as-is), ADAPT (modify), or DISCARD (build fresh) and give a one-line reason, preferring the spikes the SOLUTION files recommend. Your INDEX.md MUST then start with a '## Reuse decisions' section listing each spiked piece, its REUSE/ADAPT/DISCARD decision, and its source path under .ai/hard_parts/....\n- IF .ai/hard_parts/ DOES NOT EXIST: there are no spikes. Plan from the spec ALONE. Do NOT invent a Reuse decisions section and do NOT reference .ai/hard_parts at all. Every task is build-fresh.\n\nWrite the plan under .ai/plan/ (create the directory):\n- .ai/plan/INDEX.md : the ordered manifest, in this shape:\n    # Plan\n    <a '## Reuse decisions' section here ONLY if spikes existed, per above>\n    ## Tasks (in implementation order)\n    01. task_01_<slug>.md - <one-line summary>\n    02. task_02_<slug>.md - <one-line summary>\n  The task list order IS the dependency order: a task may only depend on the declared interfaces of EARLIER-numbered tasks. Order them so that is true.\n- .ai/plan/task_NN_<slug>.md : one file per task, numbered task_01_, task_02_, ... contiguously from 01, zero-padded, matching the INDEX order. Each task file MUST be self-contained and contain ALL of:\n    - Goal: what this one task accomplishes.\n    - Files: the exact files to create or modify.\n    - Interface/contract: the public interface/signatures this task must expose so later tasks can depend on it.\n    - Reuse: which spiked piece to copy/adapt and from which .ai/hard_parts/... path -- or 'build fresh' if there are no spikes.\n    - Acceptance criteria: concrete 'how to know this task is done', including any tests to run.\n\nGranularity: if the build is genuinely simple, a FEW tasks is fine, but ALWAYS write INDEX.md plus AT LEAST one task_NN file. If it is complex, decompose into several ordered task files; you MAY give a large multi-file task its own subdirectory .ai/plan/task_NN_<slug>/ as long as INDEX.md lists it in order. Do NOT number tasks beyond your breakdown -- later fix loops append higher numbers; you own only 01..N.\n\nDo NOT implement anything, do NOT run the build, do NOT create a CONCERNS.md or ask for approval -- just write the plan. Write INDEX.md LAST so it reflects the final task breakdown. When the plan is fully written to disk, call report_outcome with status='success'."
+  ];
+
+  // ---------- VerifyPlan: deterministic artifact gate; persist retry state; emit routing label ----------
+  // Trusts DISK, not the agent's self-report: INDEX.md exists + non-empty AND >=1 task_* -> plan_ok.
+  // Otherwise plan_missing, UNLESS the retry cap is exhausted, in which case plan_failed (bounded loop).
+  // Diagnostics to stderr; the routing label (plan_ok|plan_missing|plan_failed) is the LAST stdout line.
+  VerifyPlan [
+    shape=parallelogram, label="Verify plan artifacts",
+    tool_env="max_retries",
+    tool_command="#!/bin/sh\nset -e\npython3 - <<'PYEOF'\nimport os, json, glob, sys\nplan = '.ai/plan'\nindex = os.path.join(plan, 'INDEX.md')\ntasks = glob.glob(os.path.join(plan, 'task_*'))\nok = os.path.isfile(index) and os.path.getsize(index) > 0 and len(tasks) >= 1\nsp = '.ai/plan_state.json'\nif os.path.exists(sp):\n    st = json.load(open(sp))\nelse:\n    st = dict(retries=0)\nmax_retries = int(os.environ.get('MAX_RETRIES', '') or '2')\nif ok:\n    routing = 'plan_ok'\nelse:\n    st['retries'] = int(st.get('retries', 0)) + 1\n    routing = 'plan_missing' if st['retries'] <= max_retries else 'plan_failed'\nst['max_retries'] = max_retries\nst['last_routing'] = routing\njson.dump(st, open(sp, 'w'), indent=2)\nprint('[verify_plan] index_ok=%s tasks=%d retries=%d/%d -> %s' % (os.path.isfile(index) and os.path.getsize(index) > 0, len(tasks), st.get('retries', 0), max_retries, routing), file=sys.stderr)\nprint(routing)\nPYEOF"
+  ];
+
+  // ---------- CheckPlan: route on the disk-verified verdict ----------
+  CheckPlan [shape=diamond, label="Plan written?"];
+
+  // ---------- Report: write a run summary from state + the plan on disk (terminal, all reasons) ----------
+  Report [
+    shape=parallelogram, label="Report",
+    parse_json="true",
+    tool_command="#!/bin/sh\nset -e\npython3 - <<'PYEOF'\nimport os, json, glob, sys\nnl = chr(10)\nplan = '.ai/plan'\nst = {}\nif os.path.isfile('.ai/plan_state.json'):\n    st = json.load(open('.ai/plan_state.json'))\nindex = os.path.join(plan, 'INDEX.md')\ntasks = sorted(glob.glob(os.path.join(plan, 'task_*')))\nrouting = st.get('last_routing', 'unknown')\nlines = ['# Plan Run Summary', '']\nlines.append('- Result: ' + str(routing))\nlines.append('- Retries used: ' + str(st.get('retries', 0)))\nlines.append('- INDEX.md present: ' + str(os.path.isfile(index) and os.path.getsize(index) > 0))\nlines.append('- Task files: ' + str(len(tasks)))\nfor t in tasks:\n    lines.append('  - ' + os.path.basename(t))\nopen('.ai/plan_summary.md', 'w').write(nl.join(lines) + nl)\nprint('[report] result=%s tasks=%d' % (routing, len(tasks)), file=sys.stderr)\nprint(json.dumps({'plan_state': routing}))\nPYEOF"
+  ];
+
+  // ---------- Edges ----------
+  Start      -> Plan;
+  Plan       -> VerifyPlan;
+  VerifyPlan -> CheckPlan;
+  CheckPlan  -> Report [condition="context.tool.last_line=plan_ok",     label="plan_ok"];
+  CheckPlan  -> Plan   [condition="context.tool.last_line=plan_missing", loop_restart=true, label="plan_missing"];
+  CheckPlan  -> Report [condition="context.tool.last_line=plan_failed",  label="plan_failed"];
+  Report     -> Exit;
+}

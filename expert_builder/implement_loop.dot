@@ -1,0 +1,117 @@
+// implement_loop.dot -- the reusable inner brick of the decomposed, DTU-first expert_builder.
+//
+// WHAT IT IS
+//   A bounded, clean-context work loop over a plan directory. Given a plan of task files
+//   under .ai/plan/, it implements each one, ONE task per iteration (fresh context each
+//   turn), until every task has a .done marker or a safety limit trips.
+//   Extracted from expert_builder.dot Step 4 (ImplementInit -> Implement -> ImplementVerify
+//   -> CheckImpl), fixed to the [[eb-implement-loop-contract]] published interface.
+//
+// THE STUD (filesystem contract on .ai/plan/, relative to cwd):
+//   INPUTS  (caller preconditions):
+//     .ai/plan/INDEX.md            -- ordered task manifest (non-empty)
+//     .ai/plan/task_NN_<name>.md   -- >=1 self-contained tasks (or task_NN_<name>/ dirs)
+//     .ai/hard_parts/slot_*/...    -- optional spiked code the tasks REUSE/ADAPT
+//     cwd is a workspace (ideally a git repo)
+//   OUTPUTS (postconditions):
+//     built/modified source files  -- the actual deliverable
+//     .ai/plan/.done/<task-file>   -- one marker per completed task
+//     .ai/plan/PROGRESS.md         -- appended breadcrumb per completed task
+//     .ai/impl_state.json          -- loop state (iter/max_iter/stall_max/prev_remaining/stall_count)
+//   ROUTING SIGNAL: impl_state in {continue|all_done|stalled|max_iter}
+//
+// RESUMABLE INIT (the key fix vs the original)
+//   The original ImplementInit OVERWRITES PROGRESS.md every entry -- so the original had to
+//   re-enter mid-loop at Implement (never Init) to preserve progress across fix rounds.
+//   Here Init is IDEMPOTENT: it mkdir -p .ai/plan/.done, RE-COUNTS remaining = task_* with a
+//   MISSING marker, re-arms the counter (iter=0, stall=0, prev_remaining=remaining), and
+//   PRESERVES existing .done markers + PROGRESS.md (writes the PROGRESS.md header ONLY if
+//   absent). This is what lets the whole brick be re-invoked as a folder node across fix
+//   rounds: append a new task + append its INDEX line + re-invoke -> Init resumes from the
+//   first task with a missing marker, skipping already-done tasks. No caller state reset.
+//
+// ESCAPING (why this looks the way it does -- matches the proven sibling reality_check.dot)
+//   - This file is run by dgr directly AND (later) loaded as a shape=folder subgraph inside
+//     expert_builder.dot. In the file+subgraph path, tool_command uses SINGLE \n as the
+//     line separator (NOT the \\n of the resolver's dot_content path) and each shell body is
+//     a Python heredoc for all JSON/glob I/O -- escape-path robust.
+//   - chr(10) is used for literal newlines in Python (NOT '\n', which DOT _parse_value would
+//     corrupt into a real newline mid-token).
+//   - Params reach tool nodes ONLY as UPPERCASE env vars via tool_env= (no shell interpolation
+//     of arbitrary text). Diagnostics go to stderr; the routing label is the LAST stdout line
+//     (sets context.tool.last_line). loop_restart=true is UNQUOTED (engine truthy-check).
+//
+// PARAMS (dgr --param k=v):
+//   max_iterations   -- MAX_ITERATIONS env (default 20). Hard safety cap on iterations.
+//   stall_iterations -- STALL_ITERATIONS env (default 3). N iters w/ no drop in remaining -> stalled.
+//   (implement model is a hardcoded knob below: claude-sonnet-4-5. llm_model attributes cannot
+//    reference env vars; override by forking this DOT. The original used opus; sonnet is the
+//    cheaper local default, matching ralph_loop.)
+
+digraph implement_loop {
+  graph [
+    label="Implement Loop -- One Task per Clean-Context Iteration",
+    goal="Implement every task_* in .ai/plan/ (one per iteration) until all have .done markers or a safety limit trips.",
+    rankdir="LR",
+    default_max_retry="1",
+    default_fidelity="truncate"
+  ];
+
+  Start [shape=Mdiamond, label="Start"];
+  Exit  [shape=Msquare,  label="Exit"];
+
+  // ---------- Init: RESUMABLE / idempotent ----------
+  // mkdir -p .ai/plan/.done; recount remaining = task_* with NO matching .done marker;
+  // re-arm counter; PRESERVE existing markers + PROGRESS.md (header written only if absent).
+  // Fails loud (exit 1) if the caller precondition (INDEX.md + >=1 task_*) is unmet.
+  Init [
+    shape=parallelogram, label="Init (resumable)",
+    tool_env="max_iterations,stall_iterations",
+    tool_command="#!/bin/sh\nset -e\nmkdir -p .ai/plan/.done\npython3 - <<'PYEOF'\nimport os, json, glob, sys\nnl = chr(10)\nplan = '.ai/plan'\ndone = os.path.join(plan, '.done')\nos.makedirs(done, exist_ok=True)\nif not os.path.isfile(os.path.join(plan, 'INDEX.md')):\n    print('ERROR: .ai/plan/INDEX.md is missing. implement_loop requires a plan produced by the plan phase (INDEX.md + task_NN_*.md).', file=sys.stderr)\n    sys.exit(1)\ntasks = sorted(glob.glob(os.path.join(plan, 'task_*')))\nif not tasks:\n    print('ERROR: no .ai/plan/task_* files found. implement_loop requires at least one task.', file=sys.stderr)\n    sys.exit(1)\nremaining = [t for t in tasks if not os.path.exists(os.path.join(done, os.path.basename(t)))]\nn = len(remaining)\nmax_iter = int(os.environ.get('MAX_ITERATIONS', '') or '20')\nstall_max = int(os.environ.get('STALL_ITERATIONS', '') or '3')\nstate = dict(iter=0, max_iter=max_iter, stall_max=stall_max, prev_remaining=n, stall_count=0)\njson.dump(state, open('.ai/impl_state.json', 'w'), indent=2)\nprogress = os.path.join(plan, 'PROGRESS.md')\nif not os.path.isfile(progress):\n    header = ['# Implementation Progress', '', 'Breadcrumb trail. Each task appends what it did, the interfaces/decisions', 'the next task needs, what remains, and any gotchas. Read this before you', 'start so your work stays consistent with what came before.', '']\n    open(progress, 'w').write(nl.join(header) + nl)\n    hdr = 'created'\nelse:\n    hdr = 'preserved'\nprint('[init] tasks=%d remaining=%d markers=%d progress=%s max_iter=%d stall_max=%d' % (len(tasks), n, len(tasks) - n, hdr, max_iter, stall_max), file=sys.stderr)\nprint('ok')\nPYEOF"
+  ];
+
+  // ---------- Implement: LLM agent works EXACTLY ONE task, then stops ----------
+  // goal_gate + fidelity=full: fresh full context each iteration; the breadcrumb (not the
+  // context window) carries continuity. Marker + breadcrumb are created ONLY on genuine
+  // completion; a block leaves no marker and reports partial_success.
+  Implement [
+    shape=box, label="Implement next task",
+    goal_gate="true",
+    fidelity="full",
+    llm_provider="anthropic", llm_model="claude-sonnet-4-5",
+    max_agent_turns="80", timeout="1800s",
+    allow_partial="true",
+    prompt="You are implementing an approved plan, ONE task at a time, in order. All paths are relative to your current working directory.\n\nFIRST read the breadcrumb trail at .ai/plan/PROGRESS.md. It tells you what previous tasks already did, the interfaces and decisions they established, what remains, and any gotchas. Use it so your work is consistent with what came before.\n\nThen read .ai/plan/INDEX.md for the ordered task list and (if present) its REUSE section naming spiked pieces under .ai/hard_parts/ to copy or adapt.\n\nThe completed tasks are exactly those with a marker file under .ai/plan/.done/. For a task file .ai/plan/task_01_foo.md the marker is .ai/plan/.done/task_01_foo.md; for a task DIRECTORY .ai/plan/task_01_foo/ the marker is .ai/plan/.done/task_01_foo. List .ai/plan/.done/ to see which markers already exist.\n\nFind the FIRST task in INDEX order (numeric NN order) whose marker is MISSING. Open that ONE task (file or directory) and implement exactly it:\n- create or modify the files it names\n- honor its stated interface/contract\n- when the plan marks a spiked piece REUSE or ADAPT, copy it from its .ai/hard_parts/... path rather than rewriting from scratch\n- satisfy its acceptance criteria; if they include tests, RUN them and make them pass before declaring done\n\nImplement ONLY that single task, then STOP. Do NOT start the next task.\n\nWhen, and ONLY when, the acceptance criteria are actually met:\n1. Create the marker file .ai/plan/.done/<task-basename> (an empty file is fine; <task-basename> is the task file name including the .md, or the directory name for a dir task).\n2. APPEND (do NOT overwrite) a breadcrumb entry to .ai/plan/PROGRESS.md with this shape:\n   ## <task-basename> (done)\n   - Did: <1-3 sentences on what you built>\n   - Interfaces/decisions the next task needs: <names, signatures, file paths, key choices>\n   - Remaining tasks: <the task files after this one that still lack a marker>\n   - Watch out for: <any gotcha for the next task, or 'none'>\nThen call report_outcome with status='success'.\n\nIf you could NOT finish the task, do NOT create the marker and do NOT append a done breadcrumb; instead call report_outcome with status='partial_success' and briefly say what blocked you. The loop will retry or halt safely."
+  ];
+
+  // ---------- Verify: deterministic marker-count gate; persist state; emit routing label ----------
+  // iter++; remaining = count task_* with a MISSING marker; route per contract. Diagnostics to
+  // stderr; the routing label (continue|all_done|stalled|max_iter) is the LAST stdout line.
+  Verify [
+    shape=parallelogram, label="Verify progress",
+    tool_command="#!/bin/sh\nset -e\npython3 - <<'PYEOF'\nimport os, json, glob, sys\nplan = '.ai/plan'\ndone = os.path.join(plan, '.done')\nos.makedirs(done, exist_ok=True)\ntasks = sorted(glob.glob(os.path.join(plan, 'task_*')))\nremaining = [t for t in tasks if not os.path.exists(os.path.join(done, os.path.basename(t)))]\nsp = '.ai/impl_state.json'\nif os.path.exists(sp):\n    st = json.load(open(sp))\nelse:\n    st = dict(iter=0, max_iter=20, stall_max=3, prev_remaining=len(tasks), stall_count=0)\nst['iter'] += 1\nn = len(remaining)\nif n == 0:\n    routing = 'all_done'\nelif st['iter'] >= st['max_iter']:\n    routing = 'max_iter'\nelse:\n    if n >= st['prev_remaining']:\n        st['stall_count'] += 1\n    else:\n        st['stall_count'] = 0\n    routing = 'stalled' if st['stall_count'] >= st['stall_max'] else 'continue'\nst['prev_remaining'] = n\nst['last_routing'] = routing\njson.dump(st, open(sp, 'w'), indent=2)\nprint('[verify] iter=%d remaining=%d stall=%d -> %s' % (st['iter'], n, st['stall_count'], routing), file=sys.stderr)\nprint(routing)\nPYEOF"
+  ];
+
+  // ---------- Report: write a run summary from state (terminal, all exit reasons) ----------
+  // FOLDER-NODE ADDENDUM: also emit the terminal verdict as a NAMED context key `impl_state`
+  // (parse_json). Standalone this is inert extra state; as a shape=folder subgraph it is the value
+  // the parent surfaces via outputs="impl_state" so the parent CheckImpl diamond can route on
+  // context.impl_state. routing comes from .ai/impl_state.json last_routing (Verify writes it on
+  // EVERY exit path -> all_done | stalled | max_iter). stdout is the JSON object ONLY (diagnostics to
+  // stderr) so json.loads() over the whole stdout succeeds.
+  Report [
+    shape=parallelogram, label="Report",
+    parse_json="true",
+    tool_command="#!/bin/sh\nset -e\npython3 - <<'PYEOF'\nimport os, json, glob, sys\nnl = chr(10)\nplan = '.ai/plan'\ndone = os.path.join(plan, '.done')\nst = {}\nif os.path.isfile('.ai/impl_state.json'):\n    st = json.load(open('.ai/impl_state.json'))\ntasks = sorted(glob.glob(os.path.join(plan, 'task_*')))\nmarked = [t for t in tasks if os.path.exists(os.path.join(done, os.path.basename(t)))]\nmissing = [os.path.basename(t) for t in tasks if not os.path.exists(os.path.join(done, os.path.basename(t)))]\nrouting = st.get('last_routing', 'unknown')\nlines = ['# Implement Loop Run Summary', '']\nlines.append('- Exit reason: ' + str(routing))\nlines.append('- Iterations: ' + str(st.get('iter', 0)))\nlines.append('- Tasks total: ' + str(len(tasks)))\nlines.append('- Tasks done (marker present): ' + str(len(marked)))\nlines.append('- Tasks remaining: ' + str(len(missing)))\nif missing:\n    lines.append('- Missing markers: ' + ', '.join(missing))\nopen('.ai/impl_summary.md', 'w').write(nl.join(lines) + nl)\nprint('[report] exit=%s done=%d/%d' % (routing, len(marked), len(tasks)), file=sys.stderr)\nprint(json.dumps({'impl_state': routing}))\nPYEOF"
+  ];
+
+  // ---------- Edges ----------
+  Start     -> Init;
+  Init      -> Implement;
+  Implement -> Verify;
+  Verify    -> Implement [condition="context.tool.last_line=continue", loop_restart=true, label="continue"];
+  Verify    -> Report    [condition="context.tool.last_line=all_done", label="all_done"];
+  Verify    -> Report    [condition="context.tool.last_line=stalled",  label="stalled"];
+  Verify    -> Report    [condition="context.tool.last_line=max_iter", label="max_iter"];
+  Report    -> Exit;
+}
