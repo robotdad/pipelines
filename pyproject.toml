@@ -10,11 +10,27 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "amplifier-module-pipeline-runner @ git+https://github.com/microsoft/amplifier-bundle-attractor@6e3ce62f617e9f8d15aeac5966a2711c31b943b1#subdirectory=modules/pipeline-runner",
+    "pyright==1.1.411",
     "pytest>=8.0",
+    "ruff==0.16.0",
 ]
 
 [tool.pytest.ini_options]
 addopts = "-p no:amplifier_module"
+pythonpath = ["."]
 markers = [
     "remote: fetches a SHA-pinned pipeline package through Resolve's production materializer",
 ]
+
+[tool.ruff]
+target-version = "py311"
+include = [
+    "evaluations/expert_builder/**/*.py",
+    "tests/test_expert_builder_evaluation_grader.py",
+    "tests/test_expert_builder_evaluation_runtime.py",
+    "tests/test_expert_builder_reference_wiring.py",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "SIM", "BLE"]

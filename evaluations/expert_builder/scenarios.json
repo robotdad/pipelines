@@ -1,0 +1,375 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "a1_prepare_empty",
+      "suite": ["controlled", "acceptance"],
+      "runner": "controller_attractor",
+      "fixture": "empty_references",
+      "graph": "prepare",
+      "expected": {
+        "process_exit_code": 0,
+        "engine_status": "success",
+        "semantic_class": "prepared",
+        "semantic_verdict": "pass",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "a2_prepare_invalid_json",
+      "suite": ["controlled", "acceptance"],
+      "runner": "controller_attractor",
+      "fixture": "invalid_json",
+      "graph": "prepare",
+      "expected": {
+        "process_exit_code": 1,
+        "engine_status": "fail",
+        "semantic_class": "invalid_references",
+        "semantic_verdict": "fail",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "a3_prepare_verify_unchanged",
+      "suite": ["controlled", "acceptance"],
+      "runner": "controller_attractor",
+      "fixture": "two_references",
+      "graph": "prepare_verify",
+      "expected": {
+        "process_exit_code": 0,
+        "engine_status": "success",
+        "semantic_class": "unchanged",
+        "semantic_verdict": "pass",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "a4_verify_tracked_mutation",
+      "suite": ["controlled", "acceptance"],
+      "runner": "controller_attractor",
+      "fixture": "tracked_mutation",
+      "graph": "prepare_verify",
+      "expected": {
+        "process_exit_code": 1,
+        "engine_status": "fail",
+        "semantic_class": "reference_mutation_detected",
+        "semantic_verdict": "fail",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "b1_folder_unchanged",
+      "suite": ["controlled", "acceptance"],
+      "runner": "controller_attractor",
+      "fixture": "two_references",
+      "graph": "folder",
+      "expected": {
+        "process_exit_code": 0,
+        "engine_status": "success",
+        "semantic_class": "unchanged",
+        "semantic_verdict": "pass",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "b2_folder_tracked_mutation",
+      "suite": ["controlled", "acceptance"],
+      "runner": "controller_attractor",
+      "fixture": "tracked_mutation",
+      "graph": "folder",
+      "expected": {
+        "process_exit_code": 1,
+        "engine_status": "fail",
+        "semantic_class": "reference_mutation_detected",
+        "semantic_verdict": "fail",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "c1_rc_launch_fail",
+      "suite": ["controlled", "acceptance"],
+      "runner": "controlled_reality",
+      "fixture": "launch_fail",
+      "expected": {
+        "process_exit_code": 1,
+        "engine_status": "fail",
+        "semantic_class": "evaluation_infrastructure_failed",
+        "semantic_verdict": "fail",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "c2_rc_invalid_handle",
+      "suite": ["controlled", "acceptance"],
+      "runner": "controlled_reality",
+      "fixture": "invalid_handle",
+      "expected": {
+        "process_exit_code": 1,
+        "engine_status": "fail",
+        "semantic_class": "evaluation_infrastructure_failed",
+        "semantic_verdict": "fail",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "c3_rc_no_port_valid_lifecycle",
+      "suite": ["controlled", "acceptance"],
+      "runner": "controlled_reality",
+      "fixture": "no_port_lifecycle",
+      "sut_port": "none",
+      "qa_verdict": "pass",
+      "expected": {
+        "process_exit_code": 0,
+        "engine_status": "success",
+        "semantic_class": "target_behavior_pass",
+        "semantic_verdict": "pass",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "c4_rc_inner_exit_127",
+      "suite": ["controlled", "acceptance"],
+      "runner": "controlled_reality",
+      "fixture": "inner_exit_127",
+      "dependency_setup": true,
+      "failure_stage": "reference_setup",
+      "failure_mode": "inner",
+      "failure_code": 127,
+      "expected": {
+        "process_exit_code": 1,
+        "engine_status": "fail",
+        "semantic_class": "reference_prerequisite_failed",
+        "semantic_verdict": "fail",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "c6_rc_target_validation_inner_failure",
+      "suite": ["controlled", "acceptance"],
+      "runner": "controlled_reality",
+      "fixture": "target_validation_inner_failure",
+      "failure_stage": "target_validation",
+      "failure_mode": "inner",
+      "expected": {
+        "process_exit_code": 1,
+        "engine_status": "fail",
+        "semantic_class": "target_behavior_failed",
+        "semantic_verdict": "fail",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "c7_rc_target_validation_outer_failure",
+      "suite": ["controlled", "acceptance"],
+      "runner": "controlled_reality",
+      "fixture": "target_validation_outer_failure",
+      "failure_stage": "target_validation",
+      "failure_mode": "outer",
+      "expected": {
+        "process_exit_code": 1,
+        "engine_status": "fail",
+        "semantic_class": "evaluation_infrastructure_failed",
+        "semantic_verdict": "fail",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "c8_rc_target_toolchain_inner_failure",
+      "suite": ["controlled", "acceptance"],
+      "runner": "controlled_reality",
+      "fixture": "target_toolchain_inner_failure",
+      "target_setup": true,
+      "failure_stage": "target_toolchain",
+      "failure_mode": "inner",
+      "expected": {
+        "process_exit_code": 1,
+        "engine_status": "fail",
+        "semantic_class": "target_behavior_failed",
+        "semantic_verdict": "fail",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "c9_rc_target_toolchain_outer_failure",
+      "suite": ["controlled", "acceptance"],
+      "runner": "controlled_reality",
+      "fixture": "target_toolchain_outer_failure",
+      "target_setup": true,
+      "failure_stage": "target_toolchain",
+      "failure_mode": "outer",
+      "expected": {
+        "process_exit_code": 1,
+        "engine_status": "fail",
+        "semantic_class": "evaluation_infrastructure_failed",
+        "semantic_verdict": "fail",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "c10_rc_deploy_inner_failure",
+      "suite": ["controlled", "acceptance"],
+      "runner": "controlled_reality",
+      "fixture": "deploy_inner_failure",
+      "failure_stage": "deploy",
+      "failure_mode": "inner",
+      "expected": {
+        "process_exit_code": 1,
+        "engine_status": "fail",
+        "semantic_class": "target_behavior_failed",
+        "semantic_verdict": "fail",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "c11_rc_deploy_outer_failure",
+      "suite": ["controlled", "acceptance"],
+      "runner": "controlled_reality",
+      "fixture": "deploy_outer_failure",
+      "failure_stage": "deploy",
+      "failure_mode": "outer",
+      "expected": {
+        "process_exit_code": 1,
+        "engine_status": "fail",
+        "semantic_class": "evaluation_infrastructure_failed",
+        "semantic_verdict": "fail",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "c12_rc_reference_use_inner_failure",
+      "suite": ["controlled", "acceptance"],
+      "runner": "controlled_reality",
+      "fixture": "reference_use_inner_failure",
+      "reference_use": true,
+      "failure_stage": "reference_use",
+      "failure_mode": "inner",
+      "expected": {
+        "process_exit_code": 1,
+        "engine_status": "fail",
+        "semantic_class": "target_behavior_failed",
+        "semantic_verdict": "fail",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "c13_rc_reference_use_outer_failure",
+      "suite": ["controlled", "acceptance"],
+      "runner": "controlled_reality",
+      "fixture": "reference_use_outer_failure",
+      "reference_use": true,
+      "failure_stage": "reference_use",
+      "failure_mode": "outer",
+      "expected": {
+        "process_exit_code": 1,
+        "engine_status": "fail",
+        "semantic_class": "evaluation_infrastructure_failed",
+        "semantic_verdict": "fail",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "d1_parent_rc_exhausted",
+      "suite": ["controlled", "acceptance"],
+      "runner": "parent_rc_probe",
+      "fixture": "rc_exhausted",
+      "expected": {
+        "process_exit_code": 1,
+        "engine_status": "partial_success",
+        "semantic_class": "rc_exhausted",
+        "semantic_verdict": "partial",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "c5_rc_real_no_port_canary",
+      "suite": ["acceptance"],
+      "runner": "real_reality_canary",
+      "fixture": "real_no_port_canary",
+      "expected": {
+        "process_exit_code": 0,
+        "engine_status": "success",
+        "semantic_class": "target_behavior_pass",
+        "semantic_verdict": "pass",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "c14_rc_real_validation_reference_canary",
+      "suite": ["acceptance"],
+      "runner": "real_reality_canary",
+      "fixture": "real_validation_reference_canary",
+      "expected": {
+        "process_exit_code": 0,
+        "engine_status": "success",
+        "semantic_class": "target_behavior_pass",
+        "semantic_verdict": "pass",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "e1_parent_rc_pass_only_delivers",
+      "suite": ["controlled", "acceptance"],
+      "runner": "controlled_parent",
+      "fixture": "parent_rc_pass",
+      "expected": {
+        "process_exit_code": 0,
+        "engine_status": "success",
+        "semantic_class": "delivered",
+        "semantic_verdict": "pass",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "e2_parent_rc_exhausted_no_deliver",
+      "suite": ["controlled", "acceptance"],
+      "runner": "controlled_parent",
+      "fixture": "parent_rc_exhausted",
+      "expected": {
+        "process_exit_code": 1,
+        "engine_status": "partial_success",
+        "semantic_class": "rc_exhausted",
+        "semantic_verdict": "partial",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "e3_parent_reference_prerequisite_terminal",
+      "suite": ["controlled", "acceptance"],
+      "runner": "controlled_parent",
+      "fixture": "parent_reference_prerequisite",
+      "expected": {
+        "process_exit_code": 1,
+        "engine_status": "fail",
+        "semantic_class": "reference_prerequisite_failed",
+        "semantic_verdict": "fail",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "e4_parent_infrastructure_terminal",
+      "suite": ["controlled", "acceptance"],
+      "runner": "controlled_parent",
+      "fixture": "parent_infrastructure",
+      "expected": {
+        "process_exit_code": 1,
+        "engine_status": "fail",
+        "semantic_class": "evaluation_infrastructure_failed",
+        "semantic_verdict": "fail",
+        "cleanup": {"remaining_ids": []}
+      }
+    },
+    {
+      "id": "e5_parent_manifest_substitution_detected",
+      "suite": ["controlled", "acceptance"],
+      "runner": "controlled_parent",
+      "fixture": "parent_manifest_substitution",
+      "expected": {
+        "process_exit_code": 1,
+        "engine_status": "fail",
+        "semantic_class": "reference_manifest_substitution_detected",
+        "semantic_verdict": "fail",
+        "cleanup": {"remaining_ids": []}
+      }
+    }
+  ]
+}

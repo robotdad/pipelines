@@ -1,398 +1,369 @@
-// reality_check.dot -- reality-check a SUT OUTSIDE Resolve, under plain dgr.
+// reality_check.dot -- isolated target validation with optional documented public dependencies.
 //
-// WHY THIS EXISTS
-//   Resolve's reality_check.dot is platform-baked: it drives a reality-check SDK/broker
-//   through the reality_check_invoke handler and a fixed /opt/uv-tools/amplifier/bin/python
-//   runner, and reads /project/.resolve/config.json. It CANNOT run under dgr, and its runner
-//   is Python+Node only (no Go/Rust toolchains). This pipeline is the attractor-native contrast:
-//   the SAME detect -> launch -> deploy -> validate -> verdict -> teardown flow with ZERO
-//   broker/SDK, built only on the plain `amplifier-digital-twin` CLI (on PATH here) + two
-//   LLM agents (a dtu-profile-builder + a QA validator) + curl. Hold this up next to
-//   reality_check.dot to see that the ONLY real difference left is the broker/SDK coupling.
-//
-// DUT DETECTION (the fix): STAGE 1 now FIGURES OUT THE DUT with an LLM box node
-//   (DetectDUT) -- the broker-free equivalent of the `dtu-profile-builder` agent Resolve
-//   spawns through its SDK. It EXAMINES the SUT source and self-provisions the DETECTED
-//   toolchain (Rust -> rustup+cargo, Go -> golang, Node -> node, Python -> python, ...).
-//   NOTHING language-specific is hardcoded anywhere: Deploy just runs the script DetectDUT
-//   wrote. Same pipeline PASSES Go AND Rust with zero per-language branching.
-//
-// ONE pipeline, TWO clearly-separated stages (decompose later only if earned):
-//   STAGE 1 -- PREPARE DTU:  DETECT the DUT (toolchain/build/run/port), write a fitted DTU
-//                            profile + deploy script, launch the DTU, capture the handle.
-//   STAGE 2 -- RUN CHECK:    deploy the SUT into the DTU, exercise it, emit a pass/partial/fail verdict.
-//   plus TEARDOWN reachable from ALL terminal paths (success AND failure).
-//
-// FLOW
-//   Start -> DetectDUT -> LaunchDTU -> ParseHandle -> RouteHandle
-//   RouteHandle -> PushSUT            [launch_ok]
-//   RouteHandle -> TeardownFail       [launch_fail]
-//   PushSUT     -> Deploy
-//   Deploy      -> Validate           [deploy_ok]
-//   Deploy      -> SetFail            [deploy_fail]
-//   Validate    -> ReadVerdict
-//   ReadVerdict -> RenderPass         [pass]
-//   ReadVerdict -> RenderPartial      [partial]
-//   ReadVerdict -> SetFail            [fail]
-//   RenderPass    -> TeardownOK  -> Exit
-//   RenderPartial -> TeardownOK
-//   SetFail       -> TeardownFail
-//   TeardownFail  -> Failed
-//   19 nodes (ParseHandle split into ParseHandle + RouteHandle for BUG-2).
-//
-// PARAMS (dgr --param; delivered to tool nodes as UPPERCASE env via tool_env, and to the
-//         box/LLM nodes via $software_path / $acceptance_criteria / $sut_port non-dotted expansion):
-//   software_path        -- REQUIRED. A git URL (http/git@/ssh) OR a local directory holding the SUT.
-//   acceptance_criteria  -- REQUIRED. PROSE acceptance criteria (the QA agent reads this + curls).
-//                           Prose is the simplest form that genuinely verifies here: the Validate
-//                           node is an LLM QA agent that runs curl checks INSIDE the DTU via
-//                           `amplifier-digital-twin exec` -- exactly the proven dtu_validate.dot shape.
-//   sut_port             -- OPTIONAL. A HINT only. DetectDUT prefers the port it detects from the
-//                           source and writes to .rc/sut_port.txt; this param is the fallback if
-//                           detection cannot find one (then 8080). NO language-specific default.
-//   (deploy command is NOT a param anymore -- DetectDUT DETECTS build+run and writes .rc/deploy_cmd.sh.)
-//
-// ESCAPING / QUALITY DISCIPLINE (matches pipelines/publish_new_repo.dot):
-//   - Params reach tool nodes ONLY as UPPERCASE env vars (tool_env=) + shell-local vars.
-//     No ${lowercase.dotted} context braces anywhere -> the engine's $var expansion never
-//     mangles them, and we sidestep the dotted-key foot-guns entirely for tool nodes.
-//   - The TWO box/LLM nodes (DetectDUT, Validate) use only NON-DOTTED $-vars ($software_path,
-//     $sut_port, $dtu_container, $sut_base_url, $acceptance_criteria) -- dotted keys are silently
-//     dropped in box prompts (codergen filters
-//     `if "." not in k`), so we bridge via files (.rc/*, /tmp/rc_criteria.md) + non-dotted injected keys.
-//   - Deploy pushes DetectDUT's .rc/deploy_cmd.sh into the DTU and runs it as a FILE, so the
-//     worker shell never expands the script's $HOME/$(...)/loops -- they evaluate in the DTU.
-//   - Standalone pipeline -> single-\n escaping, \" for embedded quotes, #!/bin/sh scripts.
-//
-// CROSS-NODE HANDOFF (all under the run cwd; give it a stable --cwd):
-//   .rc/src.txt       -- resolved local SUT dir to push into the DTU         (DetectDUT -> PushSUT)
-//   .rc/profile.yaml  -- fitted DTU profile provisioning the DETECTED toolchain (DetectDUT -> LaunchDTU)
-//   .rc/deploy_cmd.sh -- DETECTED build+run+readiness script, run verbatim in the DTU (DetectDUT -> Deploy)
-//   .rc/sut_port.txt  -- DETECTED container-internal port                     (DetectDUT -> ParseHandle)
-//   .rc/handle.json   -- raw `amplifier-digital-twin launch` JSON (the DTU handle; LaunchDTU -> ParseHandle)
-//   .rc/name.txt      -- the DTU container name (scalar, extracted defensively)
-//   .rc/base_url.txt  -- the in-SUT base URL for validators (http://localhost:<detected port>)
-//   /tmp/rc_criteria.md, /tmp/rc_verdict.txt, /tmp/rc_feedback.txt -- verdict file-handoff (worker container)
-//
-// DTU launch JSON contract (confirmed against engine.py:launch return):
-//   Always: {id,name,profile,status,created_at,info}. `access` is a LIST of {label,url} and is
-//   OMITTED ENTIRELY when the profile forwards no ports -- so NEVER index access[0]; use
-//   .get("access", []) and guard length. We use `name`/`id` for the handle (always present) and
-//   derive the validator URL from the KNOWN container-internal port, not from access[].
-//
-// RUN -- STAGE 1 is an LLM now, so a --provider is REQUIRED (as it already was for Validate).
-//   The SAME command works for ANY language: DetectDUT figures out the toolchain. No per-language flags.
-//
-// RUN (Rust SUT -- SAME pipeline, zero per-language branching; DetectDUT provisions rustup+cargo):
-//   mkdir -p /tmp/rc && dgr run /home/robotdad/Resolve/dg-pipes/pipelines/reality_check.dot \
-//     --cwd /tmp/rc --provider anthropic \
-//     --param software_path=<git URL or local dir of the Rust SUT> \
-//     --param acceptance_criteria=\"GET /health returns 200 with JSON status ok. POST /items creates an item. GET /items lists items.\"
-//
-// RUN (Go items-API SUT, published repo):
-//   mkdir -p /tmp/rc && dgr run /home/robotdad/Resolve/dg-pipes/pipelines/reality_check.dot \
-//     --cwd /tmp/rc --provider anthropic \
-//     --param software_path=https://github.com/robotdad/ralph-go-itemsvc \
-//     --param acceptance_criteria="GET /health returns 200 with JSON status ok. POST /items with {\"name\":\"x\"} returns 201 and an item with an id. GET /items returns a JSON array including the created item."
-// RUN (Go items-API SUT, local dir):
-//   mkdir -p /tmp/rc && dgr run /home/robotdad/Resolve/dg-pipes/pipelines/reality_check.dot \
-//     --cwd /tmp/rc --provider anthropic \
-//     --param software_path=/home/robotdad/Resolve/dg-pipes/.work/dgr-runs/ralph_go/work \
-//     --param acceptance_criteria="GET /health returns 200 with JSON status ok. POST /items creates an item. GET /items lists items."
-
+// Exactly one repository is the SUT: the current working directory. References are inspected on
+// the host only to derive public installation and use steps; reference source is never copied to
+// the DTU. All run-local artifacts live under the target's .rc directory.
 digraph reality_check {
   graph [
-    label="reality_check -- attractor-native reality-check (no broker, dgr-runnable)",
-    rankdir=LR,
+    label="Reality check -- target QA in a fresh DTU",
+    goal="Deploy the target in a DTU, optionally install documented public dependencies, exercise the target, record evidence, and always tear down.",
+    rankdir="LR",
     default_max_retry="1",
     default_fidelity="summary:medium"
   ];
 
-  // ---------------------------------------------------------------------------
-  // Terminal nodes
-  // ---------------------------------------------------------------------------
+  Start [shape=Mdiamond, label="Start"];
+  Exit [shape=Msquare, label="Exit"];
 
-  Start  [shape=Mdiamond, label="Start"];
-  // Single exit node (engine requires exactly one). Pass/partial/fail is recorded in
-  // .rc/verdict.json — the terminal node's identity does NOT carry the verdict; every
-  // path (success AND failure) tears down the DTU and converges here.
-  Exit   [shape=Msquare,  label="Exit"];
+  InitializeReferenceDependencyPlan [
+    shape=parallelogram,
+    label="Initialize fresh reference dependency run",
+    tool_env="references_manifest_path,reference_manifest_digest",
+    parse_json="true",
+    tool_command="#!/bin/sh\nset -e\npython3 - <<'PYEOF'\nimport hashlib, json, os, secrets, stat, sys\nfrom pathlib import Path\n\nMAX_ERROR = 700\n\ndef fail(message):\n    print('ERROR: ' + str(message).replace(chr(10), ' ')[:MAX_ERROR], file=sys.stderr)\n    raise SystemExit(1)\n\ntarget = Path.cwd().resolve()\nexpected_manifest_digest = os.environ.get('REFERENCE_MANIFEST_DIGEST', '').strip()\nif len(expected_manifest_digest) != 64 or any(character not in '0123456789abcdef' for character in expected_manifest_digest):\n    fail('reference manifest digest missing or malformed in trusted pipeline context')\nsource = Path(os.environ.get('REFERENCES_MANIFEST_PATH', '').strip() or '.ai/references.json').expanduser()\ntry:\n    if source.is_symlink():\n        fail('references_manifest_path must not be a symlink')\n    canonical = source.resolve(strict=True)\n    if os.path.commonpath((os.fspath(target), os.fspath(canonical))) != os.fspath(target):\n        fail('references_manifest_path escapes the target')\n    descriptor = os.open(canonical, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))\n    try:\n        metadata = os.fstat(descriptor)\n        if not stat.S_ISREG(metadata.st_mode):\n            fail('references_manifest_path is not a regular file')\n        with os.fdopen(descriptor, 'rb', closefd=False) as stream:\n            raw = stream.read(16 * 1024 * 1024 + 1)\n        if len(raw) > 16 * 1024 * 1024:\n            fail('references manifest is too large')\n    finally:\n        os.close(descriptor)\nexcept OSError as error:\n    fail('cannot securely resolve/read references_manifest_path: ' + str(error))\nreferences_manifest_digest = hashlib.sha256(raw).hexdigest()\nif references_manifest_digest != expected_manifest_digest:\n    fail('reference manifest digest mismatch: prepared bytes differ from the trusted pipeline context')\nrun_token = secrets.token_hex(32)\nrc = target / '.rc'\ntry:\n    if rc.exists() and rc.is_symlink():\n        fail('.rc must not be a symlink')\n    rc.mkdir(exist_ok=True)\n    if rc.resolve() != rc:\n        fail('.rc does not resolve inside the target')\n    for name in ('reference_dependencies.json', 'reference_dependencies.json.tmp'):\n        prior = rc / name\n        if prior.exists() or prior.is_symlink():\n            if prior.is_dir() and not prior.is_symlink():\n                fail('cannot replace dependency artifact directory: ' + name)\n            prior.unlink()\nexcept OSError as error:\n    fail('cannot securely remove/replace prior .rc/reference_dependencies.json: ' + str(error))\nprint(json.dumps({'references_manifest_path': os.fspath(canonical), 'references_manifest_digest': references_manifest_digest, 'run_token': run_token, 'refplan_manifest_path': os.fspath(canonical), 'refplan_manifest_digest': references_manifest_digest, 'refplan_run_token': run_token}))\nPYEOF"
+  ];
 
-  // ===========================================================================
-  // STAGE 1 -- PREPARE DTU
-  // ===========================================================================
-
-  // ---------------------------------------------------------------------------
-  // DetectDUT -- the dtu-profile-builder ROLE, done LLM-native and broker-free.
-  // This is the whole reason STAGE 1 exists: FIGURE OUT THE DUT. It is a box/LLM
-  // agent with a bash tool (same capability the Validate box node already uses
-  // here to curl inside the DTU). It EXAMINES the SUT source on the HOST, DETECTS
-  // the language/toolchain/build/run/port for ANY language, and WRITES the three
-  // artifacts every downstream (deterministic) node consumes:
-  //
-  //   .rc/profile.yaml   -- a DTU profile whose provision.setup_cmds install the
-  //                         DETECTED toolchain (Rust -> rustup+cargo; Go -> golang;
-  //                         Node -> node/npm; Python -> python3+pip; ...). NOTHING
-  //                         language-specific is baked into the pipeline -- the
-  //                         agent writes whatever the SUT needs.
-  //   .rc/deploy_cmd.sh  -- the exact build+run+readiness shell the Deploy node
-  //                         runs VERBATIM inside the DTU. Deploy stays dumb plumbing.
-  //   .rc/sut_port.txt   -- the DETECTED container-internal port (validation reads it).
-  //   .rc/src.txt        -- the resolved local SUT dir PushSUT copies into the DTU.
-  //
-  // This is the true broker-free equivalent of Resolve's reality_check, which
-  // spawns the `dtu-profile-builder` agent through the SDK/broker to do exactly
-  // this detect-and-self-provision step. Here the SAME reasoning runs inline in a
-  // box node -- so the ONLY remaining difference from Resolve is the broker/SDK
-  // coupling, not the DUT detection.
-  //
-  // WHY host-side, before launch: we must inspect the real source (manifests such
-  // as go.mod / Cargo.toml / package.json / pyproject.toml) to decide the toolchain
-  // BEFORE we can write a fitted profile to launch. The agent clones the git URL or
-  // reads the local dir, then writes the artifacts. PushSUT later copies .rc/src
-  // (or the local dir) into the DTU, so both a git URL AND a local dir work uniformly.
-  //
-  // NO host port-forward is written into the profile: validators curl the SUT
-  // INSIDE the DTU via `exec` at localhost:<port>, so nothing needs to reach the
-  // SUT from the host -- and a host bind collides with occupied host ports.
-  //
-  // TOOLCHAIN-PATH FOOT-GUN (agent is told this explicitly): profile setup_cmds
-  // and the Deploy exec run in SEPARATE shells. A toolchain that installs into
-  // $HOME (rustup -> ~/.cargo, nvm, etc.) is NOT on PATH in the deploy shell unless
-  // deploy_cmd.sh re-sources it (e.g. `. "$HOME/.cargo/env"`) or uses absolute paths.
-  // The agent bakes that into deploy_cmd.sh so cargo/etc. are found at deploy time.
-  // ---------------------------------------------------------------------------
-
-  DetectDUT [
+  // The planning agent may inspect only references selected in the prepared manifest. It writes
+  // .rc/reference_dependencies.json atomically. The following deterministic reader is the trust
+  // boundary: no deployment or DTU launch begins until its schema and caller-order checks pass.
+  PlanReferenceDependencies [
     shape=box,
-    llm_model="claude-sonnet-4-6",
+    label="Plan public reference dependencies",
     llm_provider="anthropic",
-    label="Detect DUT + build profile (agent)",
+    llm_model="claude-sonnet-4-6",
     max_agent_turns="30",
     timeout="900s",
-    prompt="You are a dtu-profile-builder agent. Your job is to FIGURE OUT THE DUT (Device/Software Under Test) for a reality-check, with ZERO per-language assumptions. Detect the toolchain from the actual source and self-provision it -- Go, Rust, Node, Python, or anything else. Use your bash tool for every step; do not just describe, DO it.\n\nSOFTWARE_PATH (a git URL OR a local directory holding the SUT):\n$software_path\n\nPORT HINT (may be empty -- prefer what the source actually uses):\n$sut_port\n\nAll paths below are relative to your current working directory (the run cwd). Create .rc/ if needed: `mkdir -p .rc`.\n\nSTEP 1 -- RESOLVE THE SOURCE onto the host so you can read it:\n  If $software_path looks like a git URL (starts with http, git@, or ssh://):\n    rm -rf .rc/src && git clone --depth 1 \"$software_path\" .rc/src\n    printf '%s' .rc/src > .rc/src.txt\n  Otherwise it is a local dir -- confirm it exists and record it verbatim:\n    test -d \"$software_path\" && printf '%s' \"$software_path\" > .rc/src.txt\n  Let SRC be the contents of .rc/src.txt from here on.\n\nSTEP 2 -- EXAMINE THE SOURCE and DETECT the DUT. List files and read manifests to decide language, toolchain, build command, run command, and the port the service listens on. Look for (non-exhaustive):\n  - Rust:   Cargo.toml (note the `edition`, e.g. 2021/2024), src/main.rs\n  - Go:     go.mod (may be nested in a subdir), *.go, main package\n  - Node:   package.json (scripts.start / scripts.build), server.js\n  - Python: pyproject.toml / requirements.txt / *.py, an app entrypoint\n  - anything else: infer from the files present.\n  Detect the LISTEN PORT from the code/config (env default, hardcoded bind, README). If truly undiscoverable, fall back to the PORT HINT above, else 8080.\n\nSTEP 3 -- WRITE .rc/sut_port.txt : the single detected port number, no newline noise. Example: `printf '%s' 8080 > .rc/sut_port.txt`\n\nSTEP 4 -- WRITE .rc/profile.yaml : a DTU profile whose provision.setup_cmds install the DETECTED toolchain (NOT a hardcoded one). Requirements:\n  - base.image: ubuntu:24.04\n  - passthrough allow_external: true, with an anthropic service keyed on ANTHROPIC_API_KEY (so the QA validator's own tools work).\n  - provision.setup_cmds: a YAML list of shell strings that (a) apt-get install the common basics you need (git curl ca-certificates build-essential) and (b) install the toolchain YOU detected. Do NOT bake a toolchain the SUT does not use.\n  - Include `mkdir -p /sut` so PushSUT has a target.\n  - Do NOT add any access: ports / host port-forward (validation is in-DTU via exec).\n  Example setup_cmds lines by detected toolchain (adapt, do not blindly copy):\n    Go:     `apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates golang-go && rm -rf /var/lib/apt/lists/*`\n    Rust:   `apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates build-essential && rm -rf /var/lib/apt/lists/*`  then  `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y`\n    Node:   `apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates nodejs npm && rm -rf /var/lib/apt/lists/*`\n    Python: `apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates python3 python3-pip python3-venv && rm -rf /var/lib/apt/lists/*`\n  A valid profile shape (fill in setup_cmds from YOUR detection):\n    name: rc-local-sut\n    description: Reality-check DTU, toolchain detected by dtu-profile-builder.\n    base:\n      image: ubuntu:24.04\n    passthrough:\n      allow_external: true\n      services:\n      - name: anthropic\n        key_env: ANTHROPIC_API_KEY\n    provision:\n      setup_cmds:\n      - <toolchain install line(s) you detected>\n      - mkdir -p /sut\n  Write it EXACTLY as valid YAML (spaces, not tabs). Verify with: `python3 -c \\\"import yaml,sys; yaml.safe_load(open('.rc/profile.yaml'))\\\"` and fix any error before moving on.\n\nSTEP 5 -- WRITE .rc/deploy_cmd.sh : the exact shell the Deploy node will run VERBATIM inside the DTU (as `bash -lc`) to BUILD and RUN the SUT, then confirm readiness. The pushed source lands under /sut. Requirements:\n  - Locate the project root under /sut (it may be nested, e.g. /sut/<subdir>; find the manifest you detected -- go.mod / Cargo.toml / package.json / pyproject.toml). Do not assume it is exactly /sut.\n  - If the toolchain installed into $HOME (rustup -> ~/.cargo, nvm, etc.), SOURCE it first so the tools are on PATH in this fresh shell: e.g. `. \\\"$HOME/.cargo/env\\\"` for Rust, or use absolute paths like `$HOME/.cargo/bin/cargo`.\n  - Build with the DETECTED command (`cargo build --release`, `go build -o /tmp/sut .`, `npm ci && npm run build` if present, `pip install -r requirements.txt`, etc.).\n  - Start the SUT DETACHED so exec returns: `nohup <run cmd> >/tmp/sut.log 2>&1 &` where <run cmd> binds the detected port (e.g. the release binary, `go run` output, `node server.js`, `python3 app.py`). Ensure the process binds 0.0.0.0 or localhost on the detected port.\n  - Then a readiness loop: `for i in $(seq 1 30); do sleep 1; curl -fsS http://localhost:<PORT>/health && exit 0; done; curl -fsS http://localhost:<PORT>/ && exit 0; exit 1` -- adapt the readiness path to something the SUT actually serves (fall back to `/` if there is no /health). The script's FINAL exit code MUST be 0 iff the SUT is up and answering.\n  - Make it start with `#!/usr/bin/env bash` and `set -e` is OPTIONAL (a failing readiness curl in a loop must not abort early -- structure it so the loop can retry).\n  Write it with a heredoc, then `chmod +x .rc/deploy_cmd.sh` and syntax-check it with `bash -n .rc/deploy_cmd.sh` and fix any error.\n\nSTEP 6 -- VERIFY your artifacts exist and are non-empty as your final action:\n  `ls -l .rc/profile.yaml .rc/deploy_cmd.sh .rc/sut_port.txt .rc/src.txt` and print the detected language + port so the run log shows what you decided.\n\nMANDATORY: all four files (.rc/profile.yaml, .rc/deploy_cmd.sh, .rc/sut_port.txt, .rc/src.txt) MUST exist and be valid before you stop. If you cannot resolve the source or detect a toolchain, still write the files with your best inference -- the downstream nodes have no fallback and will fail loudly if these are missing. Do not hardcode a toolchain the SUT does not use."
+    prompt="You are planning optional dependency validation for a reality check. The current working directory is the ONLY authorized target and write location. A deterministic initializer securely read the current manifest and published this exact fresh-run binding: references_manifest_path=$refplan_manifest_path ; references_manifest_digest=$refplan_manifest_digest ; run_token=$refplan_run_token. Read that exact canonical manifest first. Select only references whose use_in_validation is true, preserving caller order exactly. Context-only references must not appear in dependencies.\n\nFor each selected reference, inspect its documentation in the local read-only checkout. Cite the exact documentation file and heading or section. Choose the applicable recommended or default PUBLIC installation path; derive public identity and version only when observable. Derive ordered setup_steps and use_steps that exercise the deployed target. Never invent commands. Never install from, copy from, package from, or otherwise use the local checkout as an installation source: it is inspection material only. Missing or ambiguous documentation, an unavailable public surface, or an unverifiable tool must become state reference_prerequisite_failed with explicit prerequisite details, not guessed commands.\n\nCreate a NEW target-owned .rc/reference_dependencies.json atomically (write a sibling temporary file and replace it; reject a symlinked .rc directory). Its exact top-level schema is: schema_version 1; state ready or reference_prerequisite_failed; references_manifest_path; references_manifest_digest; run_token; dependencies; prerequisites; setup_results; use_results. Copy all three binding values above exactly. Initialize setup_results and use_results to empty arrays; never carry results from another run. Each dependency has id, citation {file, section}, public_install {selected_path}, identity, version, setup_steps, and use_steps. setup_steps and use_steps are ordered arrays of public commands. For no selected references, write ready with empty arrays. Keep diagnostics and evidence bounded. Do not modify any reference repository."
   ];
 
-  // ---------------------------------------------------------------------------
-  // LaunchDTU -- launch the profile. Captures the FULL launch JSON to
-  // .rc/handle.json (stdout = the JSON envelope; progress noise is on stderr).
-  // Echoes launch_ok / launch_fail on the last stdout line for routing.
-  //
-  // Uses a unique name so repeat runs don't collide. continue_on_fail lets the
-  // pipeline route to teardown on a launch failure instead of dying mid-graph.
-  // ---------------------------------------------------------------------------
-
-  LaunchDTU [
+  ReadReferenceDependencyPlan [
     shape=parallelogram,
-    label="Launch DTU",
-    continue_on_fail="true",
-    tool_command="#!/bin/sh\nset -e\nmkdir -p .rc\nNAME=\"rc-local-$(date +%s)\"\nif amplifier-digital-twin launch .rc/profile.yaml --name \"$NAME\" > .rc/handle.json 2> .rc/launch.err; then\n  echo \"$NAME\" > .rc/name.txt\n  echo \"launched $NAME\" 1>&2\n  printf launch_ok\nelse\n  cat .rc/launch.err 1>&2\n  echo \"\" > .rc/name.txt\n  printf launch_fail\nfi"
+    label="Read .rc/reference_dependencies.json schema; validate use_in_validation caller order and reference_prerequisite_failed",
+    tool_env="references_manifest_path,references_manifest_digest,run_token",
+    tool_command="#!/bin/sh\nset -e\npython3 - <<'PYEOF'\nimport hashlib, json, os, stat, sys\nfrom pathlib import Path\n\nMAX = 700\n\ndef bounded(message):\n    return str(message).replace(chr(10), ' ')[:MAX]\n\ndef atomic_json(path, value):\n    temporary = path.with_name(path.name + '.tmp')\n    if temporary.exists() or temporary.is_symlink():\n        temporary.unlink()\n    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + chr(10), encoding='utf-8')\n    os.replace(temporary, path)\n\ndef reject(message, expected_path='', expected_digest='', expected_token='', expected_ids=None):\n    failure = {'schema_version': 1, 'state': 'reference_prerequisite_failed', 'references_manifest_path': expected_path, 'references_manifest_digest': expected_digest, 'run_token': expected_token, 'dependencies': [{'id': item} for item in (expected_ids or [])], 'prerequisites': [{'id': None, 'cause': bounded(message)}], 'setup_results': [], 'use_results': []}\n    try:\n        atomic_json(Path('.rc/reference_dependencies.json'), failure)\n    except Exception as error:\n        print('ERROR: cannot persist rejected dependency plan: ' + bounded(error), file=sys.stderr)\n    print('reference_prerequisite_failed')\n    raise SystemExit(0)\n\ntarget = Path.cwd().resolve()\nsource_value = os.environ.get('REFERENCES_MANIFEST_PATH', '').strip()\nexpected_digest = os.environ.get('REFERENCES_MANIFEST_DIGEST', '').strip()\nexpected_token = os.environ.get('RUN_TOKEN', '').strip()\nif not source_value or not expected_digest or not expected_token:\n    reject('missing current run binding', source_value, expected_digest, expected_token)\ntry:\n    source = Path(source_value).expanduser()\n    if source.is_symlink():\n        reject('stale or symlinked references manifest binding', source_value, expected_digest, expected_token)\n    canonical = source.resolve(strict=True)\n    if os.path.commonpath((os.fspath(target), os.fspath(canonical))) != os.fspath(target):\n        reject('references manifest escapes target', os.fspath(canonical), expected_digest, expected_token)\n    descriptor = os.open(canonical, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))\n    try:\n        if not stat.S_ISREG(os.fstat(descriptor).st_mode):\n            reject('references manifest is not regular', os.fspath(canonical), expected_digest, expected_token)\n        with os.fdopen(descriptor, 'rb', closefd=False) as stream:\n            raw = stream.read()\n    finally:\n        os.close(descriptor)\n    current_digest = hashlib.sha256(raw).hexdigest()\n    prepared = json.loads(raw)\nexcept SystemExit:\n    raise\nexcept Exception as error:\n    reject('cannot securely resolve/read current references manifest: ' + bounded(error), source_value, expected_digest, expected_token)\nif current_digest != expected_digest:\n    reject('stale references_manifest_digest', os.fspath(canonical), expected_digest, expected_token)\nif type(prepared) is not dict or set(prepared) != {'schema_version', 'target_root', 'references'} or type(prepared.get('schema_version')) is not int or prepared['schema_version'] != 1:\n    reject('prepared references manifest schema invalid', os.fspath(canonical), expected_digest, expected_token)\nif Path(prepared.get('target_root', '')).resolve() != target or type(prepared.get('references')) is not list:\n    reject('prepared references manifest target invalid', os.fspath(canonical), expected_digest, expected_token)\nexpected_ids = [item.get('id') for item in prepared['references'] if type(item) is dict and item.get('use_in_validation') is True]\nplan_path = Path('.rc/reference_dependencies.json')\ntry:\n    plan = json.loads(plan_path.read_text(encoding='utf-8'))\nexcept Exception as error:\n    reject('dependency plan missing or unreadable: ' + bounded(error), os.fspath(canonical), expected_digest, expected_token, expected_ids)\nrequired = {'schema_version', 'state', 'references_manifest_path', 'references_manifest_digest', 'run_token', 'dependencies', 'prerequisites', 'setup_results', 'use_results'}\nif type(plan) is not dict or set(plan) != required or type(plan.get('schema_version')) is not int or plan['schema_version'] != 1:\n    reject('dependency plan schema invalid or stale', os.fspath(canonical), expected_digest, expected_token, expected_ids)\nif plan.get('references_manifest_path') != os.fspath(canonical) or plan.get('references_manifest_digest') != current_digest or plan.get('run_token') != expected_token:\n    reject('dependency plan current-run binding is stale or mismatched', os.fspath(canonical), expected_digest, expected_token, expected_ids)\nif plan.get('state') not in {'ready', 'reference_prerequisite_failed'} or not all(type(plan.get(key)) is list for key in ('dependencies', 'prerequisites', 'setup_results', 'use_results')):\n    reject('dependency plan state or arrays invalid', os.fspath(canonical), expected_digest, expected_token, expected_ids)\nactual_ids = [item.get('id') for item in plan['dependencies'] if type(item) is dict]\nif actual_ids != expected_ids:\n    reject('dependency IDs do not preserve use_in_validation caller order', os.fspath(canonical), expected_digest, expected_token, expected_ids)\nif plan['setup_results']:\n    reject('pre-setup setup_results must be empty', os.fspath(canonical), expected_digest, expected_token, expected_ids)\nif plan['use_results']:\n    reject('pre-setup use_results must be empty', os.fspath(canonical), expected_digest, expected_token, expected_ids)\nif plan['state'] == 'ready':\n    for item in plan['dependencies']:\n        keys = {'id', 'citation', 'public_install', 'identity', 'version', 'setup_steps', 'use_steps'}\n        if type(item) is not dict or set(item) != keys:\n            reject('ready dependency entry schema invalid', os.fspath(canonical), expected_digest, expected_token, expected_ids)\n        citation = item['citation']; install = item['public_install']\n        if type(citation) is not dict or set(citation) != {'file', 'section'} or not all(type(citation[key]) is str and citation[key].strip() for key in citation):\n            reject('dependency documentation citation missing', os.fspath(canonical), expected_digest, expected_token, expected_ids)\n        if type(install) is not dict or set(install) != {'selected_path'} or not isinstance(install['selected_path'], str) or not install['selected_path'].strip():\n            reject('public install path missing', os.fspath(canonical), expected_digest, expected_token, expected_ids)\n        if not all(type(item[key]) is list and all(type(step) is str and step.strip() for step in item[key]) for key in ('setup_steps', 'use_steps')):\n            reject('ordered setup_steps/use_steps invalid', os.fspath(canonical), expected_digest, expected_token, expected_ids)\n        if not item['setup_steps'] or not item['use_steps']:\n            reject('each selected validation dependency requires at least one nonempty setup_step and use_step', os.fspath(canonical), expected_digest, expected_token, expected_ids)\nelif not plan['prerequisites']:\n    reject('prerequisite failure lacks evidence', os.fspath(canonical), expected_digest, expected_token, expected_ids)\nprint(plan['state'])\nPYEOF"
   ];
 
-  // ---------------------------------------------------------------------------
-  // ParseHandle -- STAGE 1 output contract. Reads .rc/handle.json DEFENSIVELY
-  // (never access[0] on an absent/empty list), writes the scalar handle keys to
-  // files, and emits PURE NON-DOTTED JSON (nothing else on stdout) so parse_json
-  // injects prompt-usable keys:
-  //   dtu_container -- the DTU name/id  (non-dotted; safe in box prompts)
-  //   sut_base_url  -- in-SUT validator base URL (http://localhost:<port>)
-  //
-  // BUG-2 FIX: a parse_json node must emit ONLY JSON on stdout. It CANNOT also
-  // print a trailing routing token -- parse_json would try to parse the whole
-  // stdout (JSON + token) and FAIL, so dtu_container/sut_base_url would never be
-  // injected. The routing decision (launch_ok/launch_fail) is delegated to a
-  // SEPARATE node (RouteHandle) that reads .rc/parse_status.txt and emits the
-  // token as its last stdout line. Keeps the defensive access[] handling here.
-  // ---------------------------------------------------------------------------
+  CheckReferenceDependencies [shape=diamond, label="Reference dependencies ready?"];
 
-  ParseHandle [
+  DetectDUTPlan [
+    shape=box,
+    label="Infer bounded target toolchain and deploy plan",
+    llm_provider="anthropic",
+    llm_model="claude-sonnet-4-6",
+    max_agent_turns="30",
+    timeout="900s",
+    prompt="Inspect the built target at $software_path and the supplied acceptance criteria. Infer separately: target toolchain setup commands; a deploy/start/readiness command; and one direct public validation command that exercises the acceptance criterion. When an acceptance criterion specifies a command, copy that command exactly as validation_command. For example, a criterion requiring `./demo-cli --self-test` requires validation_command to be exactly `./demo-cli --self-test`. The validation command itself must emit its real stdout/stderr and exit status: never wrap it, capture its output, add shell assertions, compare output, chain another command, or substitute deployment or `true` for validation. Do not create YAML, wrappers, source-path files, or absolute host/container paths. Write exactly one target-owned file, .rc/dut_plan.json, atomically, with this exact schema and no extra keys: {\"schema_version\":1,\"setup_commands\":[string,...],\"deploy_command\":\"nonempty relative-root shell command\",\"validation_command\":\"nonempty relative-root acceptance command\",\"port\":integer-or-null}. setup_commands may be empty. port must be integer 1..65535 or null. Commands must be single-line, well-quoted, relative to the repository root, and must not contain host paths, container absolute paths, traversal, or vacuous validation."
+  ];
+
+  /*
+  NormalizeDUTPlan [
     shape=parallelogram,
-    label="Parse DTU Handle",
-    parse_json="true",
-    tool_env="sut_port",
-    tool_command="#!/bin/sh\nset -e\n# Prefer the DETECTED port DetectDUT wrote; fall back to the --param, then 8080.\nPORT=\"$(cat .rc/sut_port.txt 2>/dev/null | tr -d '[:space:]')\"\n[ -n \"$PORT\" ] || PORT=\"$SUT_PORT\"\n[ -n \"$PORT\" ] || PORT=8080\npython3 - \"$PORT\" <<'PYEOF'\nimport json, pathlib, sys\nport = sys.argv[1]\nh = pathlib.Path('.rc/handle.json')\nname = ''\ntry:\n    data = json.loads(h.read_text()) if h.exists() else {}\n    # 'name'/'id' are ALWAYS present on a successful launch; 'access' may be\n    # absent entirely. Never index access[0]; derive the URL from the known port.\n    name = data.get('name') or data.get('id') or ''\n    access = data.get('access', [])\n    if not isinstance(access, list):\n        access = []\nexcept Exception as e:\n    print('handle parse error: %s' % e, file=sys.stderr)\nbase_url = 'http://localhost:%s' % port\npathlib.Path('.rc/name.txt').write_text(name)\npathlib.Path('.rc/base_url.txt').write_text(base_url)\nstatus = 'launch_ok' if name else 'launch_fail'\npathlib.Path('.rc/parse_status.txt').write_text(status)\n# STDOUT MUST BE PURE JSON for parse_json -- routing is done by RouteHandle.\nprint(json.dumps({'dtu_container': name, 'sut_base_url': base_url}))\nPYEOF"
+    label="Strictly normalize DUT plan into fixed profile and remote-root wrapper",
+    tool_env="software_path",
+    tool_command="#!/bin/sh\nset -eu\npython3 - <<'PYEOF'\nimport json, os, shlex, stat\nfrom pathlib import Path\nrc = Path('.rc'); NL = chr(10)\ndef fail(message):\n    rc.mkdir(exist_ok=True)\n    (rc / 'transport.err').write_text(str(message)[:1200] + NL, encoding='utf-8')\n    print('infrastructure_failed')\n    raise SystemExit(0)\ntry:\n    if rc.is_symlink(): fail('.rc must not be a symlink')\n    rc.mkdir(exist_ok=True)\n    plan_path = rc / 'dut_plan.json'\n    if plan_path.is_symlink(): fail('dut_plan.json must not be a symlink')\n    descriptor = os.open(plan_path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))\n    try:\n        metadata = os.fstat(descriptor)\n        if not stat.S_ISREG(metadata.st_mode): fail('dut_plan.json is not a regular file')\n        raw = os.read(descriptor, 1024 * 1024 + 1)\n    finally: os.close(descriptor)\n    if len(raw) > 1024 * 1024: fail('dut_plan.json is too large')\n    plan = json.loads(raw)\n    expected = {'schema_version', 'setup_commands', 'deploy_command', 'port'}\n    if type(plan) is not dict or set(plan) != expected: fail('dut_plan.json fields must match the exact schema')\n    if type(plan['schema_version']) is not int or plan['schema_version'] != 1: fail('schema_version must be integer 1')\n    setup = plan['setup_commands']\n    if type(setup) is not list or any(type(command) is not str or not command.strip() or chr(0) in command for command in setup): fail('setup_commands must be nonempty strings')\n    deploy = plan['deploy_command']\n    if type(deploy) is not str or not deploy.strip() or chr(0) in deploy: fail('deploy_command must be a nonempty string')\n    deploy = deploy.strip(); port = plan['port']\n    if port is not None and (type(port) is not int or not 1 <= port <= 65535): fail('port must be null or integer 1..65535')\n    source_value = os.environ.get('SOFTWARE_PATH', '').strip()\n    if not source_value: fail('software_path is missing')\n    source = Path(source_value).expanduser()\n    if source.is_symlink(): fail('software_path must not be a symlink')\n    source = source.resolve(strict=True)\n    if not source.is_dir() or source.name in ('', '.', '..'): fail('software_path must resolve to a named directory')\n    remote_root = '/sut/' + source.name\n    try: tokens = shlex.split(deploy)\n    except ValueError as error: fail('deploy_command shell syntax invalid: ' + str(error))\n    for token in tokens:\n        if token == os.fspath(source) or token.startswith(os.fspath(source) + os.sep): fail('deploy_command contains a host absolute path')\n        if token.startswith('/') and not token.startswith('//'): fail('deploy_command contains an absolute path')\n        if token == '..' or token.startswith('../') or '/..' in token: fail('deploy_command escapes the repository root')\n    profile = NL.join(['name: expert-builder-reality-check','description: Fixed clean-room target validation environment','base:','  image: ubuntu:24.04',''])\n    (rc / 'profile.yaml').write_text(profile, encoding='utf-8')\n    (rc / 'src.txt').write_text(os.fspath(source) + NL, encoding='utf-8')\n    (rc / 'sut_port.txt').write_text(('none' if port is None else str(port)) + NL, encoding='utf-8')\n    (rc / 'remote_root.txt').write_text(remote_root + NL, encoding='utf-8')\n    normalized = {'schema_version': 1, 'setup_commands': setup, 'deploy_command': deploy, 'port': port}\n    temporary = rc / 'dut_plan.json.tmp'; temporary.write_text(json.dumps(normalized, indent=2) + NL, encoding='utf-8'); temporary.replace(plan_path)\n    wrapper = NL.join(['#!/bin/sh','set -eu','cd -- ' + shlex.quote(remote_root),'exec bash -c ' + shlex.quote(deploy),''])\n    (rc / 'deploy_cmd.sh').write_text(wrapper, encoding='utf-8'); (rc / 'deploy_cmd.sh').chmod(0o700)\n    print('plan_valid')\nexcept SystemExit: raise\nexcept Exception as error: fail(error)\nPYEOF"
   ];
 
-  // ---------------------------------------------------------------------------
-  // RouteHandle -- BUG-2 FIX. Pure routing node (NO parse_json). Reads the status
-  // ParseHandle wrote to .rc/parse_status.txt and echoes launch_ok / launch_fail
-  // as its last stdout line (sets context.tool.last_line) for the routing edges.
-  // Separating this from ParseHandle is what lets ParseHandle emit pure JSON.
-  // ---------------------------------------------------------------------------
+  ];
+  */
 
-  RouteHandle [
+  /*
+  NormalizeDUTPlan [
     shape=parallelogram,
-    label="Route on DTU Handle",
-    tool_command="#!/bin/sh\ns=$(cat .rc/parse_status.txt 2>/dev/null | tr -d '[:space:]')\ncase \"$s\" in launch_ok) echo launch_ok;; *) echo launch_fail;; esac"
+    label="Strictly normalize five-field DUT plan and reject false-pass commands",
+    tool_env="software_path",
+    tool_command="#!/bin/sh\nset -eu\npython3 - <<'PYEOF'\nimport json, os, re, shlex, stat\nfrom pathlib import Path\nrc=Path('.rc'); NL=chr(10)\ndef fail(message):\n rc.mkdir(exist_ok=True); (rc/'transport.err').write_text(str(message)[:1200]+NL,encoding='utf-8'); print('infrastructure_failed'); raise SystemExit(0)\ndef atomic(path,text,mode=None):\n tmp=path.with_name(path.name+'.tmp');\n if tmp.exists() or tmp.is_symlink(): tmp.unlink()\n tmp.write_text(text,encoding='utf-8'); os.replace(tmp,path)\n if mode is not None: path.chmod(mode)\ndef safe_output(path):\n if path.is_symlink(): fail(path.name+' must not be a symlink')\n if path.exists() and not path.is_file(): fail(path.name+' must be a regular file')\ndef check_command(name,command,source,vacuous=False):\n if type(command) is not str or not command.strip() or chr(0) in command or '\\n' in command or '\\r' in command: fail(name+' must be one nonempty line')\n command=command.strip()\n try: tokens=shlex.split(command)\n except ValueError as error: fail(name+' quoting invalid: '+str(error))\n if not tokens: fail(name+' is empty')\n if os.fspath(source) in command: fail(name+' contains software_path')\n scrubbed=re.sub(r'(?i)\\b(?:https?|git\\+https?)://[^\\s\\\"\\']+','URL',command)\n if re.search(r'(^|[\\s\\\"\\'`=:(;|&])/{1,}[^\\s\\\"\\';&|)]*',scrubbed): fail(name+' contains an absolute filesystem path')\n if re.search(r'(^|[\\s\\\"\\'`=:(;|&])\\.\\.(?:/|$)',command) or '/..' in command: fail(name+' contains traversal')\n if vacuous:\n  normalized=' '.join(tokens).strip().lower()\n  if normalized in {'true',':','/bin/true','//bin/true'}: fail('validation_command is vacuous')\n return command\ntry:\n if rc.is_symlink(): fail('.rc must not be a symlink')\n if rc.exists() and not rc.is_dir(): fail('.rc must be a directory')\n rc.mkdir(exist_ok=True)\n plan_path=rc/'dut_plan.json'\n if plan_path.is_symlink(): fail('dut_plan.json must not be a symlink')\n fd=os.open(plan_path,os.O_RDONLY|getattr(os,'O_NOFOLLOW',0))\n try:\n  meta=os.fstat(fd)\n  if not stat.S_ISREG(meta.st_mode): fail('dut_plan.json is not regular')\n  raw=os.read(fd,1024*1024+1)\n finally: os.close(fd)\n if len(raw)>1024*1024: fail('dut_plan.json too large')\n plan=json.loads(raw)\n keys={'schema_version','setup_commands','deploy_command','validation_command','port'}\n if type(plan) is not dict or set(plan)!=keys: fail('dut_plan.json must have exactly five keys')\n if type(plan['schema_version']) is not int or plan['schema_version']!=1: fail('schema_version must be integer 1')\n setup=plan['setup_commands']\n if type(setup) is not list: fail('setup_commands must be an array')\n source_value=os.environ.get('SOFTWARE_PATH','').strip()\n if not source_value: fail('software_path missing')\n supplied=Path(source_value).expanduser()\n if supplied.is_symlink(): fail('software_path must not be a symlink')\n source=supplied.resolve(strict=True)\n if not source.is_dir() or source.name in ('','.','..'): fail('software_path must be a named directory')\n setup=[check_command('setup_commands item',item,source) for item in setup]\n deploy=check_command('deploy_command',plan['deploy_command'],source)\n validation=check_command('validation_command',plan['validation_command'],source,True)\n port=plan['port']\n if port is not None and (type(port) is not int or not 1<=port<=65535): fail('port must be null or integer 1..65535')\n remote='/sut/'+source.name\n outputs=['profile.yaml','src.txt','sut_port.txt','remote_root.txt','deploy_cmd.sh','validation_cmd.sh','dut_plan.json']\n stale=['verdict.json','target_validation.json','deploy_result.json','failure_stage.txt','qa_verdict.txt','feedback.txt']\n for name in outputs+stale: safe_output(rc/name)\n for name in stale:\n  path=rc/name\n  if path.exists(): path.unlink()\n normalized={'schema_version':1,'setup_commands':setup,'deploy_command':deploy,'validation_command':validation,'port':port}\n atomic(plan_path,json.dumps(normalized,indent=2)+NL)\n atomic(rc/'profile.yaml',NL.join(['name: expert-builder-reality-check','description: Fixed clean-room target validation environment','base:','  image: ubuntu:24.04','']))\n atomic(rc/'src.txt',os.fspath(source)+NL); atomic(rc/'sut_port.txt',('none' if port is None else str(port))+NL); atomic(rc/'remote_root.txt',remote+NL)\n atomic(rc/'deploy_cmd.sh',NL.join(['#!/bin/sh','set -eu','cd -- '+shlex.quote(remote),'exec bash -c '+shlex.quote(deploy),'']),0o700)\n atomic(rc/'validation_cmd.sh',NL.join(['#!/bin/sh','set -eu','cd -- '+shlex.quote(remote),'exec bash -c '+shlex.quote(validation),'']),0o700)\n print('plan_valid')\nexcept SystemExit: raise\nexcept Exception as error: fail(error)\nPYEOF"
   ];
 
-  // ===========================================================================
-  // STAGE 2 -- RUN REALITY CHECK against the prepared DTU
-  // ===========================================================================
+  ];
+  */
 
-  // ---------------------------------------------------------------------------
-  // PushSUT -- copy the resolved local SUT dir into the DTU at /sut. This is the
-  // standalone stand-in for Resolve's workspace bind-mount (a fresh DTU has no
-  // mount). Recursive push; overwrites /sut contents. Echoes push_ok/push_fail.
-  // ---------------------------------------------------------------------------
-
-  PushSUT [
+  NormalizeDUTPlan [
     shape=parallelogram,
-    label="Push SUT into DTU",
-    continue_on_fail="true",
-    tool_command="#!/bin/sh\nset -e\nNAME=\"$(cat .rc/name.txt 2>/dev/null)\"\nSRC=\"$(cat .rc/src.txt 2>/dev/null)\"\n[ -n \"$NAME\" ] || { echo no-dtu 1>&2; printf push_fail; exit 0; }\n[ -d \"$SRC\" ] || { echo \"src missing: $SRC\" 1>&2; printf push_fail; exit 0; }\nif amplifier-digital-twin file-push -r -p \"$NAME\" \"$SRC/.\" /sut/ 1>&2; then\n  printf push_ok\nelse\n  printf push_fail\nfi"
+    label="Normalize exact five-field DUT plan with recursive path and vacuity rejection",
+    tool_env="software_path",
+    tool_command="#!/bin/sh\nset -eu\npython3 - <<'PYEOF'\nimport json, os, re, shlex, stat\nfrom pathlib import Path\nrc=Path('.rc'); NL=chr(10)\ndef fail(message):\n rc.mkdir(exist_ok=True); (rc/'transport.err').write_text(str(message)[:1200]+NL,encoding='utf-8'); print('infrastructure_failed'); raise SystemExit(0)\ndef safe(path):\n if path.is_symlink(): fail(path.name+' must not be a symlink')\n if path.exists() and not path.is_file(): fail(path.name+' must be regular')\ndef atomic(path,text,mode=None):\n safe(path); tmp=path.with_name(path.name+'.tmp'); safe(tmp)\n if tmp.exists(): tmp.unlink()\n tmp.write_text(text,encoding='utf-8'); os.replace(tmp,path)\n if mode is not None: path.chmod(mode)\ndef command(name,value,source,vacuous=False):\n if type(value) is not str or not value.strip() or any(ord(c) in (0,10,13) for c in value): fail(name+' must be one nonempty line')\n value=value.strip()\n try: tokens=shlex.split(value)\n except ValueError as error: fail(name+' malformed quoting: '+str(error))\n if not tokens or os.fspath(source) in value: fail(name+' is empty or contains software_path')\n scrub=re.sub(r'(?i)(?:https?|git\\+https?)://[^ ]+','URL',value); delimiters=set(' \\t\\\"\\'`=:(;|&')\n for index,char in enumerate(scrub):\n  if char=='/' and (index==0 or scrub[index-1] in delimiters): fail(name+' contains absolute filesystem path')\n flattened=''.join(' ' if c in delimiters else c for c in value)\n if any(part=='..' or part.startswith('../') for part in flattened.split()) or '/..' in scrub: fail(name+' contains traversal')\n if vacuous:\n  normalized=' '.join(tokens).strip().lower()\n  if normalized in {'true',':','/bin/true','//bin/true'}: fail('validation_command is vacuous')\n  if any(marker in value for marker in ('&&','||',';','|','>','<','$(', '`')): fail('validation_command must be one direct command without shell composition, redirection, or substitution')\n  if re.match(r'^[A-Za-z_][A-Za-z0-9_]*=',tokens[0]): fail('validation_command must not begin with an environment assignment')\n  if tokens[0].lower() in {'if','then','else','elif','fi','for','while','until','case','esac','do','done','function','select','time','coproc','sh','bash','dash','zsh','ksh','fish','env'}: fail('validation_command must begin with the public executable, not shell control or indirection')\n  if not re.fullmatch(r'(?:\\./)?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*',tokens[0]): fail('validation_command executable must be a simple relative command')\n return value\ntry:\n if rc.is_symlink() or (rc.exists() and not rc.is_dir()): fail('.rc must be a real directory')\n rc.mkdir(exist_ok=True); plan_path=rc/'dut_plan.json'\n if plan_path.is_symlink(): fail('dut_plan.json symlink rejected')\n fd=os.open(plan_path,os.O_RDONLY|getattr(os,'O_NOFOLLOW',0))\n try:\n  if not stat.S_ISREG(os.fstat(fd).st_mode): fail('dut_plan.json nonregular')\n  raw=os.read(fd,1048577)\n finally: os.close(fd)\n if len(raw)>1048576: fail('dut_plan.json too large')\n plan=json.loads(raw); keys={'schema_version','setup_commands','deploy_command','validation_command','port'}\n if type(plan) is not dict or set(plan)!=keys or type(plan['schema_version']) is not int or plan['schema_version']!=1: fail('exact five-field schema required')\n if type(plan['setup_commands']) is not list: fail('setup_commands must be array')\n supplied=Path(os.environ.get('SOFTWARE_PATH','')).expanduser()\n if supplied.is_symlink(): fail('software_path symlink rejected')\n source=supplied.resolve(strict=True)\n if not source.is_dir() or not source.name: fail('software_path must be named directory')\n setup=[command('setup_command',item,source) for item in plan['setup_commands']]; deploy=command('deploy_command',plan['deploy_command'],source); validation=command('validation_command',plan['validation_command'],source,True); port=plan['port']\n if port is not None and (type(port) is not int or not 1<=port<=65535): fail('port must be null or integer 1..65535')\n remote='/sut/'+source.name; stale=['verdict.json','target_validation.json','deploy_result.json','failure_stage.txt','qa_verdict.txt','feedback.txt']\n for name in stale:\n  path=rc/name; safe(path)\n  if path.exists(): path.unlink()\n normalized={'schema_version':1,'setup_commands':setup,'deploy_command':deploy,'validation_command':validation,'port':port}; atomic(plan_path,json.dumps(normalized,indent=2)+NL)\n atomic(rc/'profile.yaml',NL.join(['name: expert-builder-reality-check','description: Fixed clean-room target validation environment','base:','  image: ubuntu:24.04',''])); atomic(rc/'src.txt',os.fspath(source)+NL); atomic(rc/'sut_port.txt',('none' if port is None else str(port))+NL); atomic(rc/'remote_root.txt',remote+NL)\n atomic(rc/'deploy_cmd.sh',NL.join(['#!/bin/sh','set -eu','cd -- '+shlex.quote(remote),'exec bash -c '+shlex.quote(deploy),'']),0o700); atomic(rc/'validation_cmd.sh',NL.join(['#!/bin/sh','set -eu','cd -- '+shlex.quote(remote),'exec bash -c '+shlex.quote(validation),'']),0o700); print('plan_valid')\nexcept SystemExit: raise\nexcept Exception as error: fail(error)\nPYEOF"
   ];
 
-  // ---------------------------------------------------------------------------
-  // Deploy -- build+run the SUT INSIDE the DTU and route on the INNER exit code.
-  //
-  // THE EXIT-CODE PROBLEM (same as dtu_validate.dot): `exec` always exits 0; the
-  // real exit code is inside the JSON envelope {"exit_code":N,...}. We capture the
-  // envelope and grep exit_code out (no jq needed).
-  //
-  // Deploy is now DUMB PLUMBING: it runs the AGENT-DETECTED build/run script
-  // (.rc/deploy_cmd.sh, written by DetectDUT) VERBATIM inside the DTU. There is
-  // ZERO per-language logic here -- no `go build`, no go.mod-find, no toolchain
-  // default. Whatever language DetectDUT found, that script builds+runs it.
-  //
-  // NO-FALLBACK (fail loud): if .rc/deploy_cmd.sh is missing, that means STAGE 1
-  // detection did not happen -- we FAIL rather than silently defaulting to some
-  // language. That is the whole point of ripping out the hardcoding.
-  //
-  // ESCAPING (why this is now simple): instead of assembling a deploy string in
-  // the worker shell (which forced fragile \\$ escaping so $(...)/$HOME/$i would
-  // survive to the DTU), we PUSH the agent's script file into the DTU and run it
-  // as a FILE. Everything inside deploy_cmd.sh -- $HOME, $(find ...), the readiness
-  // loop -- evaluates INSIDE the DTU because the worker shell never expands a file's
-  // contents. The worker shell only substitutes $NAME (worker-local). This also lets
-  // deploy_cmd.sh re-source a $HOME toolchain (e.g. `. \"$HOME/.cargo/env\"`) so a
-  // Rust/Node toolchain installed by setup_cmds is on PATH at deploy time.
-  //
-  // THE EXIT-CODE PROBLEM (same as dtu_validate.dot): `exec` always exits 0; the
-  // real exit code is inside the JSON envelope {\"exit_code\":N,...}. We capture the
-  // envelope and grep exit_code out (no jq needed). deploy_cmd.sh's own final exit
-  // code (0 iff the SUT is up) is what lands in that envelope.
-  // ---------------------------------------------------------------------------
-
-  Deploy [
+  // The first normalizer builds the fixed DTU artifacts. This second, deterministic gate
+  // re-validates the persisted plan and every generated handoff before any launch can occur.
+  // It intentionally preserves URL arguments while rejecting filesystem escapes in shell text.
+  NormalizeDUTPlanStrict [
     shape=parallelogram,
-    label="Deploy SUT in DTU",
-    tool_command="#!/bin/sh\nset -e\nNAME=\"$(cat .rc/name.txt 2>/dev/null)\"\n[ -n \"$NAME\" ] || { echo no-dtu 1>&2; printf deploy_fail; exit 0; }\nif [ ! -s .rc/deploy_cmd.sh ]; then\n  echo 'no .rc/deploy_cmd.sh -- STAGE 1 detection did not produce a deploy command' 1>&2\n  printf 'Deploy failed: DetectDUT produced no deploy_cmd.sh (no toolchain detected).\\n' > /tmp/rc_feedback.txt\n  printf deploy_fail\n  exit 0\nfi\n# Push the agent-detected build/run script into the DTU and run it as a FILE so\n# nothing in it is expanded by the worker shell.\namplifier-digital-twin file-push -p \"$NAME\" .rc/deploy_cmd.sh /tmp/rc_deploy.sh 1>&2 || { echo 'push deploy_cmd.sh failed' 1>&2; printf deploy_fail; exit 0; }\nOUT=\"$(amplifier-digital-twin exec \"$NAME\" -- bash -lc 'chmod +x /tmp/rc_deploy.sh; bash /tmp/rc_deploy.sh' 2>/tmp/rc_exec.err || true)\"\nCODE=\"$(printf '%s' \"$OUT\" | grep -o '\"exit_code\"[^,}]*' | grep -o '[0-9][0-9]*' | head -1)\"\nprintf '%s' \"$OUT\" 1>&2\ncat /tmp/rc_exec.err 1>&2 || true\nif [ \"$CODE\" = \"0\" ]; then\n  printf deploy_ok\nelse\n  printf 'Deploy failed (exit %s). Output above.\\n' \"${CODE:-unknown}\" > /tmp/rc_feedback.txt\n  printf deploy_fail\nfi"
+    label="Strictly verify normalized plan, artifacts, and clean run state",
+    tool_env="software_path",
+    tool_command="#!/bin/sh\nset -eu\npython3 - <<'PYEOF'\nimport json, os, re, shlex, stat\nfrom pathlib import Path\nrc=Path('.rc'); NL=chr(10)\ndef fail(message):\n (rc/'transport.err').write_text(str(message)[:1200]+NL,encoding='utf-8'); print('infrastructure_failed'); raise SystemExit(0)\ndef regular(path):\n if path.is_symlink() or not path.is_file(): fail(path.name+' must be a non-symlink regular file')\ndef read_json(path):\n regular(path); fd=os.open(path,os.O_RDONLY|getattr(os,'O_NOFOLLOW',0))\n try:\n  if not stat.S_ISREG(os.fstat(fd).st_mode): fail(path.name+' must be regular')\n  raw=os.read(fd,1048577)\n finally: os.close(fd)\n if len(raw)>1048576: fail(path.name+' too large')\n return json.loads(raw)\ndef strip_urls(text):\n return re.sub(r'(?i)(?:git\\+https?|https?)://[^\\s\\\"\\']+','URL',text)\ndef validate_command(name,value,source,vacuous=False):\n if type(value) is not str or not value.strip() or any(ch in value for ch in (chr(0),chr(10),chr(13))): fail(name+' must be one nonempty line')\n try: tokens=shlex.split(value)\n except ValueError as error: fail(name+' malformed shell quoting: '+str(error))\n if not tokens: fail(name+' is empty')\n lowered=' '.join(tokens).strip().lower()\n if vacuous:\n  if lowered in {'true',':','/bin/true','//bin/true'}: fail('validation_command is vacuous')\n  if any(marker in value for marker in ('&&','||',';','|','>','<','$(', '`')): fail('validation_command must be one direct command without shell composition, redirection, or substitution')\n  if re.match(r'^[A-Za-z_][A-Za-z0-9_]*=',tokens[0]): fail('validation_command must not begin with an environment assignment')\n  if tokens[0].lower() in {'if','then','else','elif','fi','for','while','until','case','esac','do','done','function','select','time','coproc','sh','bash','dash','zsh','ksh','fish','env'}: fail('validation_command must begin with the public executable, not shell control or indirection')\n  if not re.fullmatch(r'(?:\\./)?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*',tokens[0]): fail('validation_command executable must be a simple relative command')\n scrubbed=strip_urls(value)\n if os.fspath(source) in scrubbed: fail(name+' contains host software_path')\n if re.search(r'(^|[\\s\\\"\\'`=:(;|&])/{1,}[^\\s\\\"\\';&|)]*',scrubbed): fail(name+' contains absolute filesystem path')\n if re.search(r'(^|[\\s\\\"\\'`=:(;|&])\\.\\.(?:/|$)',scrubbed) or '/..' in scrubbed: fail(name+' contains traversal')\n return value\ntry:\n if rc.is_symlink() or not rc.is_dir(): fail('.rc must be a real directory')\n source=Path(os.environ.get('SOFTWARE_PATH','')).expanduser()\n if source.is_symlink(): fail('software_path must not be a symlink')\n source=source.resolve(strict=True)\n if not source.is_dir() or not source.name: fail('software_path must be a named real directory')\n plan_path=rc/'dut_plan.json'; plan=read_json(plan_path)\n expected={'schema_version','setup_commands','deploy_command','validation_command','port'}\n if type(plan) is not dict or set(plan)!=expected or type(plan['schema_version']) is not int or plan['schema_version']!=1: fail('dut_plan.json exact schema required')\n if type(plan['setup_commands']) is not list: fail('setup_commands must be an array')\n plan['setup_commands']=[validate_command('setup_command',item,source) for item in plan['setup_commands']]\n plan['deploy_command']=validate_command('deploy_command',plan['deploy_command'],source)\n plan['validation_command']=validate_command('validation_command',plan['validation_command'],source,True)\n if plan['port'] is not None and (type(plan['port']) is not int or not 1<=plan['port']<=65535): fail('port must be null or integer 1..65535')\n remote='/sut/'+source.name\n for name,expected_text in [('src.txt',os.fspath(source)),('remote_root.txt',remote),('sut_port.txt','none' if plan['port'] is None else str(plan['port']))]:\n  path=rc/name; regular(path)\n  if path.read_text(encoding='utf-8').strip()!=expected_text: fail(name+' does not match normalized plan')\n for name in ('profile.yaml','deploy_cmd.sh','validation_cmd.sh'):\n  regular(rc/name)\n for name in ('verdict.json','target_validation.json','deploy_result.json','failure_stage.txt','qa_verdict.txt','feedback.txt'):\n  path=rc/name\n  if path.exists() or path.is_symlink():\n   if path.is_symlink() or not path.is_file(): fail(name+' stale artifact is not a regular file')\n   path.unlink()\n tmp=plan_path.with_name(plan_path.name+'.tmp')\n if tmp.exists() or tmp.is_symlink():\n  if tmp.is_symlink() or not tmp.is_file(): fail('dut_plan.json.tmp is unsafe')\n  tmp.unlink()\n tmp.write_text(json.dumps(plan,indent=2)+NL,encoding='utf-8'); os.replace(tmp,plan_path)\n print('plan_strict_valid')\nexcept SystemExit: raise\nexcept Exception as error: fail(error)\nPYEOF"
   ];
-
-  // ---------------------------------------------------------------------------
-  // Validate -- QA agent (the ONE box/LLM node). Reads prose criteria from
-  // /tmp/rc_criteria.md, exercises the SUT via `amplifier-digital-twin exec
-  // $dtu_container -- curl ...` against $sut_base_url (in-SUT localhost:$port),
-  // then writes the verdict + feedback to the WORKER container:
-  //   /tmp/rc_verdict.txt  -- exactly one of: pass | partial | fail
-  //   /tmp/rc_feedback.txt -- human-readable findings
-  //
-  // Uses ONLY non-dotted vars ($dtu_container, $sut_base_url, $acceptance_criteria)
-  // -- injected by ParseHandle (parse_json) + dgr --param expansion. A prose QA
-  // agent + curl is the simplest validator that genuinely verifies open-ended
-  // criteria; a pure deterministic curl node can't judge arbitrary prose contracts.
-  //
-  // First action writes the criteria file so the agent (and a re-run) can read it.
-  // ---------------------------------------------------------------------------
 
   Validate [
     shape=box,
-    llm_model="claude-sonnet-4-6",
+    label="Validate deployed target",
     llm_provider="anthropic",
-    label="Validate (QA agent)",
-    max_agent_turns="20",
-    timeout="600s",
-    prompt="You are a QA reality-check agent. A System-Under-Test (SUT) is deployed and running inside a DTU container. Verify it against acceptance criteria and emit a verdict.\n\nCONTAINER: $dtu_container\nSUT BASE URL (inside the container): $sut_base_url\n\nACCEPTANCE CRITERIA:\n$acceptance_criteria\n\nSTEP 1 -- Persist the criteria so it survives (use your bash tool):\n  cat > /tmp/rc_criteria.md <<'EOF'\n$acceptance_criteria\nEOF\n\nSTEP 2 -- Exercise the SUT. Run each check by executing curl INSIDE the container:\n  amplifier-digital-twin exec $dtu_container -- curl -fsS -X GET $sut_base_url/health\n  amplifier-digital-twin exec $dtu_container -- curl -fsS -X POST $sut_base_url/items -H 'Content-Type: application/json' -d '{\"name\":\"probe\"}'\n  amplifier-digital-twin exec $dtu_container -- curl -fsS -X GET $sut_base_url/items\nAdapt the exact endpoints/methods/payloads to what the ACCEPTANCE CRITERIA describe. Record each check as PASS or FAIL with the observed status and body.\n\nSTEP 3 -- Decide a verdict:\n  pass    -- every criterion verified\n  partial -- the SUT is up and some criteria pass but at least one fails\n  fail    -- the SUT is unreachable or no criteria pass\n\nSTEP 4 (REQUIRED, do these as your FINAL actions with your bash tool, in the WORKER container -- NOT via exec):\n  printf '%s' pass > /tmp/rc_verdict.txt   (or partial, or fail -- exactly one word, no newline noise)\n  cat > /tmp/rc_feedback.txt <<'EOF'\n<one line per criterion: PASS/FAIL + the observed status/body>\nEOF\n\nMANDATORY: /tmp/rc_verdict.txt MUST be written before you stop -- if absent, the pipeline treats it as fail. Write both files as your last actions. Do not just print prose and stop."
+    llm_model="claude-sonnet-4-6",
+    max_agent_turns="24",
+    timeout="900s",
+    prompt="You are the interpretive QA judge for an already executed deterministic reality check. Read $acceptance_criteria, .rc/dut_plan.json, .rc/target_validation.json, and .rc/reference_dependencies.json. The target validation command and ordered reference-use commands have already run exactly once. Do not execute them again, do not invoke amplifier-digital-twin, and do not rewrite deterministic evidence. Interpret the raw stdout/stderr against every acceptance criterion. Write .rc/qa_verdict.txt as exactly pass, partial, or fail and .rc/feedback.txt with bounded findings. Pass only when target_validation is bound to this run/container/command with outer and inner exit 0, its observed output demonstrates the acceptance criteria, and all reference-use results succeeded. Do not modify references or deterministic evidence."
   ];
 
-  // ---------------------------------------------------------------------------
-  // ReadVerdict -- reads /tmp/rc_verdict.txt, normalises, echoes exactly one of
-  // pass|partial|fail as the last stdout line (sets context.tool.last_line).
-  // Anything absent/unexpected -> fail (a missing verdict is a structural FAIL,
-  // never a silent pass). Proven pattern: dtu_validate.dot ReadVerdict.
-  // ---------------------------------------------------------------------------
+  VerifyReferenceUseEvidence [
+    shape=parallelogram,
+    label="Mechanically verify current ordered reference use evidence",
+    tool_env="references_manifest_path,references_manifest_digest,run_token",
+    tool_command="#!/bin/sh\nset -e\npython3 - <<'PYEOF'\nimport hashlib, json, os\nfrom pathlib import Path\n\nMAX = 1200\nrc = Path('.rc')\nplan_path = Path('.rc/reference_dependencies.json')\nissues = []\nexpected_token = os.environ.get('RUN_TOKEN', '').strip()\nexpected_digest = os.environ.get('REFERENCES_MANIFEST_DIGEST', '').strip()\nsource_value = os.environ.get('REFERENCES_MANIFEST_PATH', '').strip()\nplan = {}\ntry:\n    source = Path(source_value).resolve(strict=True)\n    current_digest = hashlib.sha256(source.read_bytes()).hexdigest()\nexcept Exception as error:\n    source = Path(source_value or '.')\n    current_digest = ''\n    issues.append('missing or stale references manifest: ' + str(error))\ntry:\n    plan = json.loads(plan_path.read_text(encoding='utf-8'))\nexcept Exception as error:\n    issues.append('missing dependency use evidence plan: ' + str(error))\nif not expected_token or not expected_digest or not source_value:\n    issues.append('missing current run binding')\nif plan.get('run_token') != expected_token or plan.get('references_manifest_digest') != expected_digest or plan.get('references_manifest_path') != os.fspath(source):\n    issues.append('stale dependency plan run_token/path/digest binding')\nif current_digest != expected_digest:\n    issues.append('stale current references manifest digest')\ndependencies = plan.get('dependencies') if type(plan.get('dependencies')) is list else []\nexpected = []\nfor dependency in dependencies:\n    if type(dependency) is not dict or type(dependency.get('use_steps')) is not list:\n        issues.append('dependency use_steps schema invalid')\n        continue\n    for command in dependency['use_steps']:\n        expected.append((dependency.get('id'), command))\nresults = plan.get('use_results') if type(plan.get('use_results')) is list else []\nif len(results) != len(expected):\n    issues.append('missing use_results or result cardinality/order mismatch')\nsuccesses = 0\nfor order, (dependency_id, command) in enumerate(expected):\n    if order >= len(results) or type(results[order]) is not dict:\n        issues.append('missing result for dependency command order %d' % order)\n        continue\n    result = results[order]\n    if result.get('run_token') != expected_token or result.get('id') != dependency_id or result.get('command') != command:\n        issues.append('stale or mismatched dependency id/command order %d' % order)\n    exit_code = result.get('exit_code')\n    if type(exit_code) is not int or exit_code != 0:\n        issues.append('dependency use command failed at order %d with exit_code=%r' % (order, exit_code))\n    else:\n        successes += 1\nif len(results) > len(expected):\n    issues.append('unexpected extra use_results violate dependency command order')\nif issues:\n    current = (rc / 'qa_verdict.txt').read_text(encoding='utf-8').strip().lower() if (rc / 'qa_verdict.txt').exists() else ''\n    verdict = 'fail' if successes == 0 or current == 'fail' else 'partial'\n    verdict_tmp = rc / 'qa_verdict.txt.tmp'\n    verdict_tmp.write_text(verdict, encoding='utf-8')\n    verdict_tmp.replace(rc / 'qa_verdict.txt')\n    prior = (rc / 'feedback.txt').read_text(encoding='utf-8') if (rc / 'feedback.txt').exists() else ''\n    feedback = (prior + chr(10) + 'Mechanical reference-use evidence gate: ' + '; '.join(issues))[-MAX:]\n    feedback_tmp = rc / 'feedback.txt.tmp'\n    feedback_tmp.write_text(feedback, encoding='utf-8')\n    feedback_tmp.replace(rc / 'feedback.txt')\nprint('use_evidence_checked')\nPYEOF"
+  ];
 
   ReadVerdict [
     shape=parallelogram,
-    label="Read Verdict",
-    tool_command="#!/bin/sh\nv=$(cat /tmp/rc_verdict.txt 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')\ncase \"$v\" in pass) echo pass;; partial) echo partial;; fail) echo fail;; *) echo fail;; esac"
+    label="Read target verdict",
+    tool_command="#!/bin/sh\nvalue=$(cat .rc/qa_verdict.txt 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')\ncase \"$value\" in pass) printf pass;; partial) printf partial;; *) printf fail;; esac"
   ];
-
-  // ---------------------------------------------------------------------------
-  // RenderPass / RenderPartial / SetFail -- render a structured verdict summary
-  // to .rc/verdict.json (the pipeline's OUTPUT ARTIFACT) and to stdout. Each
-  // reads /tmp/rc_feedback.txt for the human-readable findings. SetFail also
-  // covers the deploy_fail short-circuit (skips validation entirely).
-  // ---------------------------------------------------------------------------
 
   RenderPass [
     shape=parallelogram,
-    label="Render Verdict: PASS",
-    tool_command="#!/bin/sh\nset -e\nmkdir -p .rc\nNAME=\"$(cat .rc/name.txt 2>/dev/null)\"\nFB=\"$(cat /tmp/rc_feedback.txt 2>/dev/null | head -c 1200 | tr -d '\"' | tr '\\n' ' ' || true)\"\nprintf '{\"verdict\": \"pass\", \"dtu\": \"%s\", \"findings\": \"%s\"}\\n' \"$NAME\" \"$FB\" | tee .rc/verdict.json\necho \"REALITY CHECK: PASS\" 1>&2\nprintf verdict_pass"
+    label="Render target verdict: pass",
+    tool_command="#!/bin/sh\nset -e\npython3 - <<'PYEOF'\nimport json\nfrom pathlib import Path\nrc = Path('.rc')\ndeps = json.loads((rc / 'reference_dependencies.json').read_text(encoding='utf-8'))\nfeedback = (rc / 'feedback.txt').read_text(encoding='utf-8')[:1200] if (rc / 'feedback.txt').exists() else ''\nreport = {'verdict': 'pass', 'outcome_class': 'target_behavior_pass', 'findings': feedback, 'reference_dependencies': deps}\ntemp = rc / 'verdict.json.tmp'; temp.write_text(json.dumps(report, indent=2) + chr(10), encoding='utf-8'); temp.replace(rc / 'verdict.json')\nprint('verdict_pass')\nPYEOF"
   ];
 
   RenderPartial [
     shape=parallelogram,
-    label="Render Verdict: PARTIAL",
-    tool_command="#!/bin/sh\nset -e\nmkdir -p .rc\nNAME=\"$(cat .rc/name.txt 2>/dev/null)\"\nFB=\"$(cat /tmp/rc_feedback.txt 2>/dev/null | head -c 1200 | tr -d '\"' | tr '\\n' ' ' || true)\"\nprintf '{\"verdict\": \"partial\", \"dtu\": \"%s\", \"findings\": \"%s\"}\\n' \"$NAME\" \"$FB\" | tee .rc/verdict.json\necho \"REALITY CHECK: PARTIAL\" 1>&2\nprintf verdict_partial"
+    label="Render target verdict: partial",
+    tool_command="#!/bin/sh\nset -e\npython3 - <<'PYEOF'\nimport json\nfrom pathlib import Path\nrc = Path('.rc')\ndeps = json.loads((rc / 'reference_dependencies.json').read_text(encoding='utf-8'))\nfeedback = (rc / 'feedback.txt').read_text(encoding='utf-8')[:1200] if (rc / 'feedback.txt').exists() else ''\nreport = {'verdict': 'partial', 'outcome_class': 'target_behavior_partial', 'findings': feedback, 'reference_dependencies': deps}\ntemp = rc / 'verdict.json.tmp'; temp.write_text(json.dumps(report, indent=2) + chr(10), encoding='utf-8'); temp.replace(rc / 'verdict.json')\nprint('verdict_partial')\nPYEOF"
   ];
 
   SetFail [
     shape=parallelogram,
-    label="Render Verdict: FAIL",
-    tool_command="#!/bin/sh\nset -e\nmkdir -p .rc\nNAME=\"$(cat .rc/name.txt 2>/dev/null)\"\nFB=\"$(cat /tmp/rc_feedback.txt 2>/dev/null | head -c 1200 | tr -d '\"' | tr '\\n' ' ' || echo 'reality check failed')\"\nprintf '{\"verdict\": \"fail\", \"dtu\": \"%s\", \"findings\": \"%s\"}\\n' \"$NAME\" \"$FB\" | tee .rc/verdict.json\necho \"REALITY CHECK: FAIL\" 1>&2\nprintf verdict_fail"
+    label="Render target verdict: fail",
+    tool_command="#!/bin/sh\nset -e\npython3 - <<'PYEOF'\nimport json\nfrom pathlib import Path\nrc = Path('.rc')\ntry:\n    deps = json.loads((rc / 'reference_dependencies.json').read_text(encoding='utf-8'))\nexcept Exception:\n    deps = {'schema_version': 1, 'state': 'ready', 'dependencies': [], 'setup_results': [], 'use_results': []}\nfeedback = (rc / 'feedback.txt').read_text(encoding='utf-8')[:1200] if (rc / 'feedback.txt').exists() else 'target reality check failed'\nreport = {'verdict': 'fail', 'outcome_class': 'target_behavior_failed', 'findings': feedback, 'reference_dependencies': deps}\ntemp = rc / 'verdict.json.tmp'; temp.write_text(json.dumps(report, indent=2) + chr(10), encoding='utf-8'); temp.replace(rc / 'verdict.json')\nprint('verdict_fail')\nPYEOF"
   ];
 
-  // ===========================================================================
-  // TEARDOWN -- reachable from ALL terminal paths (resolve_validated.dot FIX 4).
-  //   TeardownOK   -- success/partial path -> Exit
-  //   TeardownFail -- failure path (launch/deploy/validate fail) -> Failed
-  // Both continue_on_fail=true: destroy runs even if the container is already
-  // gone. Read the name from .rc/name.txt so teardown works regardless of which
-  // upstream node last ran. NO terminal path bypasses a teardown -> no orphans.
-  // ===========================================================================
-
-  TeardownOK [
+  RenderReferencePrerequisiteFailure [
     shape=parallelogram,
-    label="Teardown DTU (ok)",
-    continue_on_fail="true",
-    tool_command="#!/bin/sh\nNAME=\"$(cat .rc/name.txt 2>/dev/null)\"\nif [ -n \"$NAME\" ]; then amplifier-digital-twin destroy \"$NAME\" 1>&2 && echo \"destroyed $NAME\" 1>&2; else echo \"no DTU to destroy\" 1>&2; fi\nprintf torn_down"
+    label="Render reference prerequisite failure: {\"verdict\": \"fail\", \"outcome_class\": \"reference_prerequisite_failed\"}",
+    tool_command="#!/bin/sh\nset -e\npython3 - <<'PYEOF'\nimport json\nfrom pathlib import Path\nrc = Path('.rc')\ntry:\n    reference_dependencies = json.loads((rc / 'reference_dependencies.json').read_text(encoding='utf-8'))\nexcept Exception as error:\n    reference_dependencies = {'read_error': str(error)[:500]}\n# {\"verdict\": \"fail\", \"outcome_class\": \"reference_prerequisite_failed\"}\nreport = {'verdict': 'fail', 'outcome_class': 'reference_prerequisite_failed', 'findings': 'reference_prerequisite_failed: documented public dependency setup is unavailable or failed', 'reference_dependencies': reference_dependencies}\ntemp = rc / 'verdict.json.tmp'; temp.write_text(json.dumps(report, indent=2) + chr(10), encoding='utf-8'); temp.replace(rc / 'verdict.json')\nprint('reference_prerequisite_rendered')\nPYEOF"
   ];
 
-  TeardownFail [
+  // Strict transport nodes deliberately retain the requested launch name only as cleanup metadata.
+  // No operation is permitted to use it as a substitute for the identifier returned by DTU.
+  LaunchDTUStrict [
     shape=parallelogram,
-    label="Teardown DTU (fail)",
-    continue_on_fail="true",
-    tool_command="#!/bin/sh\nNAME=\"$(cat .rc/name.txt 2>/dev/null)\"\nif [ -n \"$NAME\" ]; then amplifier-digital-twin destroy \"$NAME\" 1>&2 && echo \"destroyed $NAME\" 1>&2; else echo \"no DTU to destroy\" 1>&2; fi\nprintf torn_down"
+    label="Launch DTU with random run-bound requested name",
+    tool_env="run_token",
+    tool_command="#!/bin/sh\nset -eu\nmkdir -p .rc\nrequested=$(python3 - <<'PYEOF'\nimport os,secrets\nprint('rc-'+os.environ.get('RUN_TOKEN','run')[:10]+'-'+secrets.token_hex(6))\nPYEOF\n)\nprintf '%s\\n' \"$requested\" > .rc/requested_name.txt\nif amplifier-digital-twin launch .rc/profile.yaml --name \"$requested\" > .rc/launch.json 2> .rc/launch.err; then\n  printf 'launch_ok\\n' > .rc/launch_status.txt\n  printf launch_ok\nelse\n  printf 'launch_fail\\n' > .rc/launch_status.txt\n  printf launch_fail\nfi"
   ];
 
-  // ---------------------------------------------------------------------------
-  // Edges
-  // ---------------------------------------------------------------------------
+  ParseHandleStrict [
+    shape=parallelogram,
+    label="Strictly parse returned DTU id/name",
+    parse_json="true",
+    tool_env="sut_port",
+    tool_command="#!/bin/sh\nset -eu\npython3 - <<'PYEOF'\nimport json, os\nfrom pathlib import Path\nrc = Path('.rc')\ntry:\n    payload = json.loads((rc / 'launch.json').read_text(encoding='utf-8'))\n    if not isinstance(payload, dict): raise ValueError('launch payload is not an object')\n    values = [payload.get('id'), payload.get('name')]\n    container = next((value.strip() for value in values if isinstance(value, str) and value.strip()), '')\n    if not container: raise ValueError('launch payload has no non-empty id or name')\n    port = ((rc / 'sut_port.txt').read_text(encoding='utf-8').strip() if (rc / 'sut_port.txt').exists() else os.environ.get('SUT_PORT', '').strip())\n    base_url = '' if port.lower() in ('', 'none', 'null') else 'http://localhost:' + port\n    (rc / 'dtu_container.txt').write_text(container + chr(10), encoding='utf-8')\n    (rc / 'parse_status.txt').write_text('handle_ok' + chr(10), encoding='utf-8')\n    (rc / 'base_url.txt').write_text(base_url + chr(10), encoding='utf-8')\n    print(json.dumps({'dtu_container': container, 'sut_base_url': base_url}))\nexcept Exception as error:\n    (rc / 'parse_status.txt').write_text('handle_fail' + chr(10), encoding='utf-8')\n    (rc / 'handle.err').write_text(str(error)[:1200] + chr(10), encoding='utf-8')\n    print(json.dumps({'dtu_container': '', 'sut_base_url': ''}))\nPYEOF"
+  ];
 
-  // STAGE 1: prepare
-  Start        -> DetectDUT;
-  DetectDUT    -> LaunchDTU;
-  LaunchDTU    -> ParseHandle;
-  ParseHandle  -> RouteHandle;
-  RouteHandle  -> PushSUT      [condition="context.tool.last_line=launch_ok",  label="launched"];
-  RouteHandle  -> TeardownFail [condition="context.tool.last_line=launch_fail", label="launch failed"];
+  RouteHandleStrict [
+    shape=parallelogram,
+    label="Route strict DTU transport state",
+    tool_command="#!/bin/sh\nset -eu\nstatus=$(cat .rc/parse_status.txt 2>/dev/null | tr -d '[:space:]')\ncase \"$status\" in handle_ok) printf handle_ok;; *) printf handle_fail;; esac"
+  ];
 
-  // STAGE 2: run check
-  PushSUT  -> Deploy;
-  Deploy   -> Validate [condition="context.tool.last_line=deploy_ok",   label="deployed"];
-  Deploy   -> SetFail  [condition="context.tool.last_line=deploy_fail", label="deploy failed"];
-  Validate -> ReadVerdict;
-  ReadVerdict -> RenderPass    [condition="context.tool.last_line=pass",    label="pass"];
+  PushSUTStrict [
+    shape=parallelogram,
+    label="Push source directory to basename-preserving /sut parent",
+    tool_command="#!/bin/sh\nset -eu\nname=$(cat .rc/dtu_container.txt 2>/dev/null | tr -d '[:space:]')\nsrc=$(cat .rc/src.txt 2>/dev/null)\nroot=$(cat .rc/remote_root.txt 2>/dev/null)\nif [ -z \"$name\" ] || [ -z \"$src\" ] || [ ! -d \"$src\" ] || [ \"$root\" != \"/sut/$(basename \"$src\")\" ]; then printf push_fail; exit 0; fi\nif amplifier-digital-twin file-push -r -p \"$name\" \"$src\" /sut/ > .rc/push.json 2> .rc/push.err; then printf push_ok; else printf push_fail; fi"
+  ];
+
+  /*
+  InstallTargetToolchainStrict [
+    shape=parallelogram,
+    label="Install target toolchain in DTU; parse every outer/inner envelope",
+    tool_command="#!/bin/sh\nset -eu\npython3 - <<'PYEOF'\nimport json, subprocess\nfrom pathlib import Path\nrc = Path('.rc')\ndef emit(value): print(value)\ntry:\n    plan = json.loads((rc / 'dut_plan.json').read_text(encoding='utf-8'))\n    commands = plan['setup_commands']\n    container = (rc / 'dtu_container.txt').read_text(encoding='utf-8').strip()\n    if type(commands) is not list or not container: raise ValueError('normalized plan or DTU identifier missing')\nexcept Exception as error:\n    (rc / 'transport.err').write_text(str(error)[:1200] + chr(10), encoding='utf-8'); emit('infrastructure_failed'); raise SystemExit(0)\nresults = []\nfor command in commands:\n    completed = subprocess.run(['amplifier-digital-twin', 'exec', container, '--', 'bash', '-c', command], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n    entry = {'command': command, 'outer_exit_code': completed.returncode, 'stdout_tail': completed.stdout[-1200:], 'stderr_tail': completed.stderr[-1200:]}; results.append(entry)\n    if completed.returncode != 0:\n        (rc / 'target_setup_results.json').write_text(json.dumps(results, indent=2) + chr(10), encoding='utf-8'); emit('infrastructure_failed'); raise SystemExit(0)\n    try:\n        envelope = json.loads(completed.stdout); inner = envelope.get('exit_code')\n        if not isinstance(inner, int): raise ValueError('missing integer inner exit_code')\n    except Exception as error:\n        entry['parse_error'] = str(error)[:500]; (rc / 'target_setup_results.json').write_text(json.dumps(results, indent=2) + chr(10), encoding='utf-8'); emit('infrastructure_failed'); raise SystemExit(0)\n    entry['exit_code'] = inner\n    if inner != 0:\n        (rc / 'target_setup_results.json').write_text(json.dumps(results, indent=2) + chr(10), encoding='utf-8'); emit('infrastructure_failed'); raise SystemExit(0)\n(rc / 'target_setup_results.json').write_text(json.dumps(results, indent=2) + chr(10), encoding='utf-8')\nemit('toolchain_ok')\nPYEOF"
+  ];
+
+  ];
+  */
+
+  InstallTargetToolchainStrict [
+    shape=parallelogram,
+    label="Run target setup from normalized remote root with strict envelopes",
+    tool_command="#!/bin/sh\nset -eu\npython3 - <<'PYEOF'\nimport json, subprocess\nfrom pathlib import Path\nrc=Path('.rc'); plan=json.loads((rc/'dut_plan.json').read_text()); commands=plan['setup_commands']; container=(rc/'dtu_container.txt').read_text().strip(); root=(rc/'remote_root.txt').read_text().strip(); results=[]\ndef save(): (rc/'target_setup_results.json').write_text(json.dumps(results,indent=2)+chr(10),encoding='utf-8')\nfor command in commands:\n script='cd -- \"$1\" && exec bash -c \"$2\"'; completed=subprocess.run(['amplifier-digital-twin','exec',container,'--','bash','-c',script,'setup',root,command],text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE); entry={'command':command,'outer_exit_code':completed.returncode,'stdout_tail':completed.stdout[-1200:],'stderr_tail':completed.stderr[-1200:]}; results.append(entry)\n if completed.returncode!=0: save(); print('infrastructure_failed'); raise SystemExit(0)\n try:\n  envelope=json.loads(completed.stdout); inner=envelope.get('exit_code')\n  if type(inner) is not int: raise ValueError('missing integer inner exit_code')\n except Exception as error: entry['parse_error']=str(error)[:500]; save(); print('infrastructure_failed'); raise SystemExit(0)\n entry['exit_code']=inner\n if inner!=0: save(); print('infrastructure_failed'); raise SystemExit(0)\nsave(); print('toolchain_ok')\nPYEOF"
+  ];
+
+  InstallReferenceDependenciesStrict [
+    shape=parallelogram,
+    label="Run public dependency setup steps in order; parse inner DTU result",
+    tool_command="#!/bin/sh\nset -eu\npython3 - <<'PYEOF'\nimport json, subprocess\nfrom pathlib import Path\nrc = Path('.rc'); path = rc / 'reference_dependencies.json'\ndef write(value):\n    temporary = path.with_name(path.name + '.tmp'); temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + chr(10), encoding='utf-8'); temporary.replace(path)\ndef result(kind): print(kind)\ntry:\n    plan = json.loads(path.read_text(encoding='utf-8'))\n    if not isinstance(plan, dict) or plan.get('state') != 'ready' or not isinstance(plan.get('dependencies'), list): raise ValueError('dependency plan is not ready')\n    container = (rc / 'dtu_container.txt').read_text(encoding='utf-8').strip()\n    if not container: raise ValueError('missing returned DTU container id')\nexcept Exception as error:\n    (rc / 'transport.err').write_text(str(error)[:1200] + chr(10), encoding='utf-8'); result('infrastructure_failed'); raise SystemExit(0)\nsetup = []\nfor dependency in plan['dependencies']:\n    if not isinstance(dependency, dict) or not isinstance(dependency.get('setup_steps'), list):\n        (rc / 'transport.err').write_text('invalid dependency setup schema' + chr(10), encoding='utf-8'); result('infrastructure_failed'); raise SystemExit(0)\n    for command in dependency['setup_steps']:\n        completed = subprocess.run(['amplifier-digital-twin', 'exec', container, '--', 'bash', '-c', command], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n        entry = {'id': dependency.get('id'), 'command': command, 'outer_exit_code': completed.returncode, 'stdout_tail': completed.stdout[-1200:], 'stderr_tail': completed.stderr[-1200:]}\n        if completed.returncode != 0:\n            setup.append(entry); plan['setup_results'] = setup; write(plan); result('infrastructure_failed'); raise SystemExit(0)\n        try:\n            envelope = json.loads(completed.stdout)\n            inner = envelope.get('exit_code')\n            if not isinstance(inner, int): raise ValueError('missing integer inner exit_code')\n        except Exception as error:\n            entry['parse_error'] = str(error)[:500]; setup.append(entry); plan['setup_results'] = setup; write(plan); result('infrastructure_failed'); raise SystemExit(0)\n        entry['exit_code'] = inner; setup.append(entry); plan['setup_results'] = setup\n        if inner != 0:\n            plan['state'] = 'reference_prerequisite_failed'; plan.setdefault('prerequisites', []).append({'id': dependency.get('id'), 'cause': 'public setup step inner exit code ' + str(inner)}); write(plan); result('reference_prerequisite_failed'); raise SystemExit(0)\nwrite(plan); result('setup_ok')\nPYEOF"
+  ];
+
+  DeployStrict [
+    shape=parallelogram,
+    label="Deploy target; parse outer and inner DTU result strictly",
+    tool_command="#!/bin/sh\nset -eu\npython3 - <<'PYEOF'\nimport json, subprocess\nfrom pathlib import Path\nrc = Path('.rc'); container = (rc / 'dtu_container.txt').read_text(encoding='utf-8').strip()\ndef emit(value): print(value)\ntry:\n    pushed = subprocess.run(['amplifier-digital-twin', 'file-push', '-p', container, '.rc/deploy_cmd.sh', '/root/rc_deploy.sh'], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n    (rc / 'deploy_push.out').write_text(pushed.stdout, encoding='utf-8'); (rc / 'deploy_push.err').write_text(pushed.stderr, encoding='utf-8')\n    if pushed.returncode != 0: emit('infrastructure_failed'); raise SystemExit(0)\n    executed = subprocess.run(['amplifier-digital-twin', 'exec', container, '--', 'bash', '-c', 'chmod +x /root/rc_deploy.sh; /root/rc_deploy.sh'], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n    (rc / 'deploy.out').write_text(executed.stdout, encoding='utf-8'); (rc / 'deploy.err').write_text(executed.stderr, encoding='utf-8')\n    if executed.returncode != 0: emit('infrastructure_failed'); raise SystemExit(0)\n    envelope = json.loads(executed.stdout); inner = envelope.get('exit_code')\n    if not isinstance(inner, int): raise ValueError('missing integer inner exit_code')\n    emit('deploy_ok' if inner == 0 else 'deploy_fail')\nexcept SystemExit: raise\nexcept Exception as error:\n    (rc / 'transport.err').write_text(str(error)[:1200] + chr(10), encoding='utf-8'); emit('infrastructure_failed')\nPYEOF"
+  ];
+
+  ExecuteReferenceUseSteps [
+    shape=parallelogram,
+    label="Run documented reference use steps in caller order; parse inner result",
+    tool_command="#!/bin/sh\nset -eu\npython3 - <<'PYEOF'\nimport json, subprocess\nfrom pathlib import Path\nrc = Path('.rc'); path = rc / 'reference_dependencies.json'\ndef write(value):\n    temporary = path.with_name(path.name + '.tmp'); temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + chr(10), encoding='utf-8'); temporary.replace(path)\ndef emit(value): print(value)\ntry:\n    plan = json.loads(path.read_text(encoding='utf-8')); container = (rc / 'dtu_container.txt').read_text(encoding='utf-8').strip()\n    if plan.get('state') != 'ready' or not container: raise ValueError('dependency plan or returned DTU unavailable')\nexcept Exception as error:\n    (rc / 'transport.err').write_text(str(error)[:1200] + chr(10), encoding='utf-8'); emit('infrastructure_failed'); raise SystemExit(0)\nresults = []\nfor dependency in plan.get('dependencies', []):\n    if not isinstance(dependency, dict) or not isinstance(dependency.get('use_steps'), list): emit('infrastructure_failed'); raise SystemExit(0)\n    for command in dependency['use_steps']:\n        completed = subprocess.run(['amplifier-digital-twin', 'exec', container, '--', 'bash', '-c', command], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n        entry = {'run_token': plan.get('run_token'), 'id': dependency.get('id'), 'command': command, 'outer_exit_code': completed.returncode, 'stdout_tail': completed.stdout[-1200:], 'stderr_tail': completed.stderr[-1200:]}; results.append(entry)\n        if completed.returncode != 0: plan['use_results'] = results; write(plan); emit('infrastructure_failed'); raise SystemExit(0)\n        try:\n            envelope = json.loads(completed.stdout); inner = envelope.get('exit_code')\n            if not isinstance(inner, int): raise ValueError('missing integer inner exit_code')\n        except Exception as error:\n            entry['parse_error'] = str(error)[:500]; plan['use_results'] = results; write(plan); emit('infrastructure_failed'); raise SystemExit(0)\n        entry['exit_code'] = inner; plan['use_results'] = results\n        if inner != 0: write(plan); emit('use_fail'); raise SystemExit(0)\nwrite(plan); emit('use_ok')\nPYEOF"
+  ];
+
+  ExecuteTargetValidationStrict [
+    shape=parallelogram,
+    label="Execute deterministic target validation and publish a context-bound evidence seal",
+    tool_env="run_token",
+    parse_json="true",
+    tool_command="#!/bin/sh\nset -eu\npython3 - <<'PYEOF'\nimport hashlib, json, os, subprocess\nfrom pathlib import Path\nrc=Path('.rc'); NL=chr(10); evidence_path=rc/'target_validation.json'\ndef atomic(value):\n tmp=evidence_path.with_name(evidence_path.name+'.tmp'); tmp.write_text(json.dumps(value,indent=2)+NL,encoding='utf-8'); os.replace(tmp,evidence_path)\ndef stage(name):\n tmp=rc/'failure_stage.txt.tmp'; tmp.write_text(name+NL,encoding='utf-8'); os.replace(tmp,rc/'failure_stage.txt')\ndef emit(state):\n digest=hashlib.sha256(evidence_path.read_bytes()).hexdigest() if evidence_path.is_file() and not evidence_path.is_symlink() else ''\n print(json.dumps({'target_validation_state':state,'target_validation_digest':digest}))\ntry:\n plan=json.loads((rc/'dut_plan.json').read_text(encoding='utf-8')); command=plan['validation_command']\n container=(rc/'dtu_container.txt').read_text(encoding='utf-8').strip(); token=os.environ.get('RUN_TOKEN','').strip()\n if not container or not token or type(command) is not str: raise ValueError('validation binding unavailable')\n pushed=subprocess.run(['amplifier-digital-twin','file-push','-p',container,'.rc/validation_cmd.sh','/root/rc_validate.sh'],text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)\n if pushed.returncode!=0: raise RuntimeError('validation wrapper push failed: '+pushed.stderr[-500:])\n executed=subprocess.run(['amplifier-digital-twin','exec',container,'--','bash','-c','chmod +x /root/rc_validate.sh; /root/rc_validate.sh'],text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)\n evidence={'schema_version':1,'run_token':token,'container':container,'command':command,'outer_exit_code':executed.returncode,'exit_code':None,'stdout':'','stderr':''}\n if executed.returncode!=0:\n  evidence['stdout']=executed.stdout[-4000:]; evidence['stderr']=executed.stderr[-4000:]; atomic(evidence); emit('infrastructure_failed'); raise SystemExit(0)\n try:\n  envelope=json.loads(executed.stdout); inner=envelope.get('exit_code'); out=envelope.get('stdout'); err=envelope.get('stderr')\n  if type(inner) is not int or type(out) is not str or type(err) is not str: raise ValueError('invalid validation envelope fields')\n except Exception as error:\n  evidence['stderr']=str(error)[:1000]; atomic(evidence); emit('infrastructure_failed'); raise SystemExit(0)\n evidence.update({'exit_code':inner,'stdout':out[-4000:],'stderr':err[-4000:]}); atomic(evidence)\n if inner!=0: stage('target_validation'); emit('validation_fail')\n else: emit('validation_ok')\nexcept SystemExit: raise\nexcept Exception as error:\n (rc/'transport.err').write_text(str(error)[:1200]+NL,encoding='utf-8'); emit('infrastructure_failed')\nPYEOF"
+  ];
+
+  VerifyTargetValidationEvidence [
+    shape=parallelogram,
+    label="Verify target-validation evidence against the pre-LLM context seal",
+    tool_env="run_token,target_validation_digest",
+    tool_command="#!/bin/sh\nset -eu\npython3 - <<'PYEOF'\nimport hashlib, json, os, sys\nfrom pathlib import Path\nrc=Path('.rc'); issues=[]\ntry:\n evidence_path=rc/'target_validation.json'\n if evidence_path.is_symlink() or not evidence_path.is_file(): raise ValueError('target_validation.json must be a non-symlink regular file')\n raw=evidence_path.read_bytes(); expected_digest=os.environ.get('TARGET_VALIDATION_DIGEST','').strip(); actual_digest=hashlib.sha256(raw).hexdigest()\n evidence=json.loads(raw); plan=json.loads((rc/'dut_plan.json').read_text(encoding='utf-8')); container=(rc/'dtu_container.txt').read_text().strip(); token=os.environ.get('RUN_TOKEN','').strip()\nexcept Exception as error:\n print('ERROR: validation evidence unavailable: '+str(error),file=sys.stderr); raise SystemExit(1)\nif not expected_digest or actual_digest!=expected_digest: issues.append('digest')\nexpected={'schema_version','run_token','container','command','outer_exit_code','exit_code','stdout','stderr'}\nif type(evidence) is not dict or set(evidence)!=expected: issues.append('schema')\nif evidence.get('schema_version')!=1 or evidence.get('run_token')!=token or evidence.get('container')!=container or evidence.get('command')!=plan.get('validation_command'): issues.append('binding')\nif type(evidence.get('outer_exit_code')) is not int or evidence.get('outer_exit_code')!=0 or type(evidence.get('exit_code')) is not int or evidence.get('exit_code')!=0: issues.append('exit')\nif type(evidence.get('stdout')) is not str or type(evidence.get('stderr')) is not str: issues.append('outputs')\nif issues:\n print('ERROR: target validation evidence invalid: '+','.join(issues),file=sys.stderr); raise SystemExit(1)\nprint('validation_evidence_ok')\nPYEOF"
+  ];
+
+  MarkReferenceUseFailure [
+    shape=parallelogram,
+    label="Record reference-use target failure stage",
+    tool_command="#!/bin/sh\nset -eu\ntmp=.rc/failure_stage.txt.tmp\nprintf 'reference_use\\n' > \"$tmp\"\nmv \"$tmp\" .rc/failure_stage.txt\nprintf marked"
+  ];
+
+  MarkDeployTransportFailure [
+    shape=parallelogram,
+    label="Record deploy transport failure stage",
+    tool_command="#!/bin/sh\nset -eu\npython3 - <<'PYEOF'\nimport json, os\nfrom pathlib import Path\nrc=Path('.rc'); out=(rc/'deploy.out').read_text(encoding='utf-8',errors='replace')[-4000:] if (rc/'deploy.out').exists() else ''; err=(rc/'deploy.err').read_text(encoding='utf-8',errors='replace')[-4000:] if (rc/'deploy.err').exists() else ''\nvalue={'schema_version':1,'outer_exit_code':None,'exit_code':None,'stdout':out,'stderr':err}\ntmp=rc/'deploy_result.json.tmp'; tmp.write_text(json.dumps(value,indent=2)+chr(10),encoding='utf-8'); os.replace(tmp,rc/'deploy_result.json')\nstage=rc/'failure_stage.txt.tmp'; stage.write_text('deploy'+chr(10)); os.replace(stage,rc/'failure_stage.txt'); print('marked')\nPYEOF"
+  ];
+
+  MarkReferenceUseTransportFailure [
+    shape=parallelogram,
+    label="Record reference-use transport failure stage",
+    tool_command="#!/bin/sh\nset -eu\nprintf 'reference_use\\n' > .rc/failure_stage.txt.tmp\nmv .rc/failure_stage.txt.tmp .rc/failure_stage.txt\nprintf marked"
+  ];
+
+  MarkTargetValidationTransportFailure [
+    shape=parallelogram,
+    label="Record target-validation transport failure stage",
+    tool_command="#!/bin/sh\nset -eu\nprintf 'target_validation\\n' > .rc/failure_stage.txt.tmp\nmv .rc/failure_stage.txt.tmp .rc/failure_stage.txt\nprintf marked"
+  ];
+
+  PersistDeployOK [
+    shape=parallelogram,
+    label="Persist successful deploy envelope",
+    tool_command="#!/bin/sh\nset -eu\npython3 - <<'PYEOF'\nimport json, os\nfrom pathlib import Path\nrc=Path('.rc'); envelope=json.loads((rc/'deploy.out').read_text(encoding='utf-8')); value={'schema_version':1,'outer_exit_code':0,'inner_exit_code':envelope['exit_code'],'stdout':envelope.get('stdout',''),'stderr':envelope.get('stderr','')}; tmp=rc/'deploy_result.json.tmp'; tmp.write_text(json.dumps(value,indent=2)+chr(10)); os.replace(tmp,rc/'deploy_result.json'); print('deploy_recorded_ok')\nPYEOF"
+  ];
+
+  PersistDeployFail [
+    shape=parallelogram,
+    label="Persist failed deploy envelope and stage",
+    tool_command="#!/bin/sh\nset -eu\npython3 - <<'PYEOF'\nimport json, os\nfrom pathlib import Path\nrc=Path('.rc'); envelope=json.loads((rc/'deploy.out').read_text(encoding='utf-8')); value={'schema_version':1,'outer_exit_code':0,'inner_exit_code':envelope['exit_code'],'stdout':envelope.get('stdout',''),'stderr':envelope.get('stderr','')}; tmp=rc/'deploy_result.json.tmp'; tmp.write_text(json.dumps(value,indent=2)+chr(10)); os.replace(tmp,rc/'deploy_result.json'); stage=rc/'failure_stage.txt.tmp'; stage.write_text('deploy'+chr(10)); os.replace(stage,rc/'failure_stage.txt'); print('deploy_recorded_fail')\nPYEOF"
+  ];
+
+  ClassifyTargetToolchain [
+    shape=parallelogram,
+    label="Classify target toolchain inner failure separately from transport",
+    tool_command="#!/bin/sh\nset -eu\npython3 - <<'PYEOF'\nimport json, os\nfrom pathlib import Path\nrc=Path('.rc')\ntry: results=json.loads((rc/'target_setup_results.json').read_text())\nexcept Exception: results=[]\nif results and results[-1].get('outer_exit_code')==0 and type(results[-1].get('exit_code')) is int and results[-1]['exit_code']!=0:\n tmp=rc/'failure_stage.txt.tmp'; tmp.write_text('target_toolchain'+chr(10)); os.replace(tmp,rc/'failure_stage.txt'); print('toolchain_fail')\nelif results and results[-1].get('outer_exit_code') not in (None,0): print('infrastructure_failed')\nelse: print('infrastructure_failed')\nPYEOF"
+  ];
+
+  EmbedTargetValidationEvidence [
+    shape=parallelogram,
+    label="Embed immutable target-validation evidence in rendered verdict",
+    tool_command="#!/bin/sh\nset -eu\npython3 - <<'PYEOF'\nimport json, os\nfrom pathlib import Path\nrc=Path('.rc'); report=json.loads((rc/'verdict.json').read_text()); path=rc/'target_validation.json'\nif path.exists(): report['target_validation']=json.loads(path.read_text())\ntmp=rc/'verdict.json.tmp'; tmp.write_text(json.dumps(report,indent=2)+chr(10)); os.replace(tmp,rc/'verdict.json'); print('validation_embedded')\nPYEOF"
+  ];
+
+  RenderInfrastructureFailure [
+    shape=parallelogram,
+    label="Render evaluation infrastructure failure",
+    tool_command="#!/bin/sh\nset -eu\npython3 - <<'PYEOF'\nimport json\nfrom pathlib import Path\nrc = Path('.rc')\nfindings = ''\nfor name in ('transport.err', 'handle.err', 'launch.err', 'push.err', 'deploy.err'):\n    path = rc / name\n    if path.exists(): findings += name + ': ' + path.read_text(encoding='utf-8', errors='replace')[-800:] + chr(10)\nreport = {'verdict': 'fail', 'outcome_class': 'evaluation_infrastructure_failed', 'findings': findings[:4000] or 'DTU transport, launch, handle, file-push, or result envelope failed', 'reference_dependencies': {}}\ntemporary = rc / 'verdict.json.tmp'; temporary.write_text(json.dumps(report, indent=2) + chr(10), encoding='utf-8'); temporary.replace(rc / 'verdict.json')\nprint('infrastructure_rendered')\nPYEOF"
+  ];
+
+  /*
+  Cleanup [
+    shape=parallelogram,
+    label="Record cleanup evidence; destroy returned DTU only",
+    runs_on="always",
+    tool_command="#!/bin/sh\nset -eu\npython3 - <<'PYEOF'\nimport json, subprocess\nfrom pathlib import Path\nrc = Path('.rc'); requested = (rc / 'requested_name.txt').read_text(encoding='utf-8').strip() if (rc / 'requested_name.txt').exists() else ''\ncontainer = (rc / 'dtu_container.txt').read_text(encoding='utf-8').strip() if (rc / 'dtu_container.txt').exists() else ''\nevidence = {'requested_name': requested, 'dtu_container': container, 'attempted': bool(container), 'outer_exit_code': None, 'stdout_tail': '', 'stderr_tail': ''}\nif container:\n    completed = subprocess.run(['amplifier-digital-twin', 'destroy', container], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n    evidence.update({'outer_exit_code': completed.returncode, 'stdout_tail': completed.stdout[-1200:], 'stderr_tail': completed.stderr[-1200:]})\n    if completed.returncode != 0:\n        try: report = json.loads((rc / 'verdict.json').read_text(encoding='utf-8'))\n        except Exception: report = {}\n        report.update({'verdict': 'fail', 'outcome_class': 'evaluation_infrastructure_failed', 'findings': 'DTU cleanup failed: ' + completed.stderr[-800:]})\n        temporary = rc / 'verdict.json.tmp'; temporary.write_text(json.dumps(report, indent=2) + chr(10), encoding='utf-8'); temporary.replace(rc / 'verdict.json')\n(rc / 'cleanup.json').write_text(json.dumps(evidence, indent=2) + chr(10), encoding='utf-8')\nprint('cleanup_recorded')\nPYEOF"
+  ];
+
+  ];
+  */
+
+  CleanupIdentityStrict [
+    shape=parallelogram,
+    label="Destroy only a run-bound identity and record strict cleanup evidence",
+    runs_on="always",
+    tool_env="run_token",
+    tool_command="#!/bin/sh\nset -eu\npython3 - <<'PYEOF'\nimport json, os, subprocess\nfrom pathlib import Path\nrc=Path('.rc'); NL=chr(10)\ndef read(name):\n path=rc/name\n return path.read_text(encoding='utf-8').strip() if path.exists() and path.is_file() and not path.is_symlink() else ''\nrequested=read('requested_name.txt'); returned=read('dtu_container.txt'); launch=read('launch_status.txt'); parsed=read('parse_status.txt'); token=os.environ.get('RUN_TOKEN','').strip()\nidentifier=''; source='none'\nif returned: identifier=returned; source='returned_identifier'\nelif launch=='launch_ok' and parsed=='handle_fail' and requested: identifier=requested; source='requested_name_fallback'\nevidence={'schema_version':1,'run_token':token,'requested_name':requested,'returned_identifier':returned,'destroy_identifier':identifier,'identity_source':source,'attempted':bool(identifier),'outer_exit_code':None,'stdout':'','stderr':''}\nif identifier:\n completed=subprocess.run(['amplifier-digital-twin','destroy',identifier],text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE); evidence.update({'outer_exit_code':completed.returncode,'stdout':completed.stdout[-1200:],'stderr':completed.stderr[-1200:]})\ntmp=rc/'cleanup.json.tmp'; tmp.write_text(json.dumps(evidence,indent=2)+NL,encoding='utf-8'); os.replace(tmp,rc/'cleanup.json')\ntry: report=json.loads((rc/'verdict.json').read_text(encoding='utf-8'))\nexcept Exception: report={}\nsemantic_pass=report.get('verdict')=='pass' and report.get('outcome_class')=='target_behavior_pass'\ncleanup_failed=(not token) or (identifier and evidence['outer_exit_code']!=0) or (semantic_pass and (not evidence['attempted'] or evidence['outer_exit_code']!=0 or source!='returned_identifier'))\nif cleanup_failed:\n report.update({'verdict':'fail','outcome_class':'evaluation_infrastructure_failed','findings':'cleanup identity/attempt/destroy verification failed','cleanup':evidence}); verdict=rc/'verdict.json.tmp'; verdict.write_text(json.dumps(report,indent=2)+NL,encoding='utf-8'); os.replace(verdict,rc/'verdict.json')\nprint('cleanup_recorded')\nPYEOF"
+  ];
+
+  TerminalLatch [
+    shape=parallelogram,
+    label="Latch semantic verdict after cleanup",
+    runs_on="always",
+    tool_command="#!/bin/sh\nset -eu\npython3 - <<'PYEOF'\nimport json, sys\nfrom pathlib import Path\ntry: report = json.loads(Path('.rc/verdict.json').read_text(encoding='utf-8'))\nexcept Exception as error: print('missing verdict after cleanup: ' + str(error), file=sys.stderr); raise SystemExit(1)\nif report.get('verdict') == 'pass' and report.get('outcome_class') == 'target_behavior_pass': print('target_behavior_pass'); raise SystemExit(0)\nprint(str(report.get('outcome_class') or 'unclassified_failure'), file=sys.stderr)\nraise SystemExit(1)\nPYEOF"
+  ];
+
+  // Every semantic outcome reaches Cleanup and then TerminalLatch.  The latch is the sole
+  // authority for the engine outcome; rendering a failure can never be overwritten by cleanup.
+  Start -> InitializeReferenceDependencyPlan;
+  InitializeReferenceDependencyPlan -> PlanReferenceDependencies;
+  InitializeReferenceDependencyPlan -> RenderInfrastructureFailure [condition="context.outcome=fail", label="initializer failed"];
+  PlanReferenceDependencies -> ReadReferenceDependencyPlan;
+  PlanReferenceDependencies -> RenderInfrastructureFailure [condition="context.outcome=fail", label="planner transport failed"];
+  ReadReferenceDependencyPlan -> CheckReferenceDependencies;
+  ReadReferenceDependencyPlan -> RenderInfrastructureFailure [condition="context.outcome=fail", label="reader failed"];
+  CheckReferenceDependencies -> DetectDUTPlan [condition="context.tool.last_line=ready", label="ready"];
+  CheckReferenceDependencies -> RenderReferencePrerequisiteFailure [condition="context.tool.last_line=reference_prerequisite_failed", label="prerequisite failed"];
+
+  DetectDUTPlan -> NormalizeDUTPlan;
+  DetectDUTPlan -> RenderInfrastructureFailure [condition="context.outcome=fail", label="DUT planning failed"];
+  NormalizeDUTPlan -> NormalizeDUTPlanStrict [condition="context.tool.last_line=plan_valid", label="normalized"];
+  NormalizeDUTPlan -> RenderInfrastructureFailure [condition="context.tool.last_line=infrastructure_failed", label="invalid DUT plan"];
+  NormalizeDUTPlanStrict -> LaunchDTUStrict [condition="context.tool.last_line=plan_strict_valid", label="strict plan valid"];
+  NormalizeDUTPlanStrict -> RenderInfrastructureFailure [condition="context.tool.last_line=infrastructure_failed", label="strict plan rejected"];
+  LaunchDTUStrict -> ParseHandleStrict [condition="context.tool.last_line=launch_ok", label="launched"];
+  LaunchDTUStrict -> RenderInfrastructureFailure [condition="context.tool.last_line=launch_fail", label="launch failed"];
+  ParseHandleStrict -> RouteHandleStrict;
+  RouteHandleStrict -> PushSUTStrict [condition="context.tool.last_line=handle_ok", label="returned handle"];
+  RouteHandleStrict -> RenderInfrastructureFailure [condition="context.tool.last_line=handle_fail", label="invalid handle"];
+  PushSUTStrict -> InstallTargetToolchainStrict [condition="context.tool.last_line=push_ok", label="pushed"];
+  PushSUTStrict -> RenderInfrastructureFailure [condition="context.tool.last_line=push_fail", label="file-push failed"];
+  InstallTargetToolchainStrict -> InstallReferenceDependenciesStrict [condition="context.tool.last_line=toolchain_ok", label="target toolchain ready"];
+  InstallTargetToolchainStrict -> ClassifyTargetToolchain [condition="context.tool.last_line=infrastructure_failed", label="classify target toolchain"];
+  ClassifyTargetToolchain -> SetFail [condition="context.tool.last_line=toolchain_fail", label="target toolchain behavior failed"];
+  ClassifyTargetToolchain -> RenderInfrastructureFailure [condition="context.tool.last_line=infrastructure_failed", label="target toolchain transport failed"];
+
+  InstallReferenceDependenciesStrict -> DeployStrict [condition="context.tool.last_line=setup_ok", label="setup complete"];
+  InstallReferenceDependenciesStrict -> RenderReferencePrerequisiteFailure [condition="context.tool.last_line=reference_prerequisite_failed", label="setup inner exit failed"];
+  InstallReferenceDependenciesStrict -> RenderInfrastructureFailure [condition="context.tool.last_line=infrastructure_failed", label="setup transport failed"];
+  DeployStrict -> PersistDeployOK [condition="context.tool.last_line=deploy_ok", label="deployed"];
+  DeployStrict -> PersistDeployFail [condition="context.tool.last_line=deploy_fail", label="target deploy failed"];
+  DeployStrict -> MarkDeployTransportFailure [condition="context.tool.last_line=infrastructure_failed", label="deploy transport failed"];
+  MarkDeployTransportFailure -> RenderInfrastructureFailure;
+  PersistDeployOK -> ExecuteReferenceUseSteps;
+  PersistDeployFail -> SetFail;
+  ExecuteReferenceUseSteps -> ExecuteTargetValidationStrict [condition="context.tool.last_line=use_ok", label="uses complete"];
+  ExecuteReferenceUseSteps -> MarkReferenceUseFailure [condition="context.tool.last_line=use_fail", label="target use failed"];
+  ExecuteReferenceUseSteps -> MarkReferenceUseTransportFailure [condition="context.tool.last_line=infrastructure_failed", label="use transport failed"];
+  MarkReferenceUseTransportFailure -> RenderInfrastructureFailure;
+  MarkReferenceUseFailure -> SetFail;
+  ExecuteTargetValidationStrict -> Validate [condition="context.target_validation_state=validation_ok", label="sealed deterministic validation passed"];
+  ExecuteTargetValidationStrict -> SetFail [condition="context.target_validation_state=validation_fail", label="sealed deterministic validation failed"];
+  ExecuteTargetValidationStrict -> MarkTargetValidationTransportFailure [condition="context.target_validation_state=infrastructure_failed", label="validation transport failed"];
+  MarkTargetValidationTransportFailure -> RenderInfrastructureFailure;
+  Validate -> VerifyReferenceUseEvidence;
+  Validate -> RenderInfrastructureFailure [condition="context.outcome=fail", label="QA execution failed"];
+  VerifyReferenceUseEvidence -> VerifyTargetValidationEvidence;
+  VerifyReferenceUseEvidence -> RenderInfrastructureFailure [condition="context.outcome=fail", label="use evidence malformed"];
+  VerifyTargetValidationEvidence -> ReadVerdict;
+  VerifyTargetValidationEvidence -> RenderInfrastructureFailure [condition="context.outcome=fail", label="target validation evidence malformed"];
+  ReadVerdict -> RenderPass [condition="context.tool.last_line=pass", label="pass"];
   ReadVerdict -> RenderPartial [condition="context.tool.last_line=partial", label="partial"];
-  ReadVerdict -> SetFail       [condition="context.tool.last_line=fail",    label="fail"];
+  ReadVerdict -> SetFail [condition="context.tool.last_line=fail", label="fail"];
 
-  // Teardown from ALL terminal paths (no orphaned DTUs).
-  RenderPass    -> TeardownOK;
-  RenderPartial -> TeardownOK;
-  TeardownOK    -> Exit;
-
-  SetFail       -> TeardownFail;
-  TeardownFail  -> Exit;
+  RenderPass -> EmbedTargetValidationEvidence;
+  RenderPartial -> EmbedTargetValidationEvidence;
+  RenderReferencePrerequisiteFailure -> EmbedTargetValidationEvidence;
+  RenderInfrastructureFailure -> EmbedTargetValidationEvidence;
+  SetFail -> EmbedTargetValidationEvidence;
+  EmbedTargetValidationEvidence -> CleanupIdentityStrict;
+  CleanupIdentityStrict -> TerminalLatch;
+  TerminalLatch -> Exit [condition="context.outcome=success", label="semantic success"];
+  TerminalLatch -> Exit [condition="context.outcome=fail", label="semantic failure"];
 }

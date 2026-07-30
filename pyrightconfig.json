@@ -1,0 +1,12 @@
+{
+  "include": [
+    "evaluations/expert_builder",
+    "tests/test_expert_builder_evaluation_grader.py",
+    "tests/test_expert_builder_evaluation_runtime.py",
+    "tests/test_expert_builder_reference_wiring.py"
+  ],
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "standard"
+}

@@ -20,6 +20,8 @@ EXPECTED_PACKAGE_FILES = frozenset(
         "implement_loop.dot",
         "reality_check.dot",
         "deliver.dot",
+        "references/prepare.dot",
+        "references/verify.dot",
     }
 )
 PIPELINE_URI_TEMPLATE = (
