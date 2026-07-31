@@ -46,6 +46,19 @@ base:
     limits.cpu: "8"
     limits.memory: "16GiB"
 
+# The attractor BUNDLE hardcodes microsoft/amplifier-bundle-attractor@main as
+# the source for its loop-pipeline module (bundles/attractor-pipeline.yaml).
+# That clone is what lands in ~/.amplifier/cache and gets inserted at
+# sys.path[0] when the module is mounted -- so installing the CLI from a fork
+# silently still gets upstream's engine. Redirect the bundle clone here rather
+# than editing the fork's bundle yaml, which keeps the branch clean for the
+# upstream PR. Remove this block once the fix lands upstream.
+url_rewrites:
+  default_match_mode: boundary
+  rules:
+    - match: github.com/microsoft/amplifier-bundle-attractor
+      target: github.com/robotdad/amplifier-bundle-attractor
+
 passthrough:
   allow_external: true
   services:
