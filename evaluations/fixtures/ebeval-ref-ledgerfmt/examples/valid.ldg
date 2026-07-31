@@ -1,0 +1,8 @@
+# LedgerLine v1 sample
+
+123.26|groceries|450|corner store|2
+123.26|groceries|1299|weekly shop|r
+124.26|transit|275-|refund on card|0
+125.26|rent|0||b
+126.26|misc|7|note with \p pipe|y
+366.26|misc|0450|leading zeros and \\ backslash|g

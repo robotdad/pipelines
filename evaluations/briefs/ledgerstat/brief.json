@@ -1,0 +1,13 @@
+{
+  "description": "Small stdlib CLI over a non-guessable text format specified only in a reference repository.",
+  "root_env_var": "LEDGERSTAT_ROOT",
+  "exercises": ["C1", "C2", "C3", "C4", "R1", "R2"],
+  "references": [
+    {
+      "id": "ledgerfmt",
+      "clone_url": "https://github.com/robotdad/ebeval-ref-ledgerfmt.git",
+      "ref": "main",
+      "use_in_validation": false
+    }
+  ]
+}

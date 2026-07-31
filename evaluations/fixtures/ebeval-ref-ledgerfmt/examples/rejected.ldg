@@ -1,0 +1,8 @@
+123.26|groceries|450|bad check|z
+123.26|groceries|-450|leading minus is malformed|
+0.26|groceries|1|day zero|
+123.6|groceries|1|one digit year|
+123.26|Groceries|1|uppercase category|
+123.26|groceries|4.50|decimal point|
+123.26|groceries|450|four fields only
+123.26|groceries|450|bad \x escape|

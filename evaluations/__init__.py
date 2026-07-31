@@ -1,1 +1,1 @@
-"""Repository-local deterministic evaluation packages."""
+"""Evaluation harness and briefs for the expert_builder pipeline."""
