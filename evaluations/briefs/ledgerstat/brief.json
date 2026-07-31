@@ -6,7 +6,7 @@
     {
       "id": "ledgerfmt",
       "clone_url": "https://github.com/robotdad/ebeval-ref-ledgerfmt.git",
-      "ref": "main",
+      "ref": "9fc9138a969a1fd81d1c5c99aabb41cfa1581def",
       "use_in_validation": false
     }
   ]
