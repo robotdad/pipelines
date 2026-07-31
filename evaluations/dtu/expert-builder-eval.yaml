@@ -1,0 +1,167 @@
+# Isolated evaluation environment for the expert_builder pipeline.
+#
+# WHY A DTU AT ALL
+#   The pipeline builds software. Running it on a developer host means every
+#   measurement is contaminated by that host's Python, git config, and installed
+#   tooling. Here the whole environment is declarative and pinned, so a run six
+#   weeks from now is comparable to today's.
+#
+# WHY NESTED INCUS
+#   expert_builder's reality_check stage launches its OWN DTU to validate the
+#   built software in a clean room. Rather than hand this container the host's
+#   Incus socket (effectively host root, and leaked siblings would survive
+#   teardown), we give it a complete inner Incus daemon. reality_check's
+#   containers are then ordinary children of that daemon: destroying this
+#   environment destroys them too.
+#
+#   Modelled on the DTU bundle's own dtu-host-in-incus profile. Docker and Gitea
+#   are omitted -- reality_check drives DTUs via exec/file-push only, and both
+#   repositories we need are on GitHub.
+#
+# WHY A FORK OF ATTRACTOR
+#   A root DOT loaded from a file kept an empty source_dir, so relative
+#   `dot_file=` child refs resolved against --cwd instead of beside the pipeline.
+#   That forced local runs to flatten the DOT tree into the target workspace --
+#   which would let the agent under evaluation read reality_check.dot and see
+#   exactly how it is about to be judged. The fork fixes the resolution instead.
+#   Upstream PR pending; this profile pins the branch until it lands.
+#
+# Usage:
+#   amplifier-digital-twin launch expert-builder-eval \
+#     --var PIPELINES_SHA=<sha> --var ATTRACTOR_REF=fix/root-graph-source-dir
+
+name: expert-builder-eval
+description: >
+  Isolated, pinned environment for evaluating the expert_builder pipeline.
+  Carries its own nested Incus daemon so the pipeline's reality_check stage can
+  launch clean-room DTUs without touching the host.
+
+base:
+  image: ubuntu:24.04
+  config:
+    # Load-bearing: without it the inner Incus daemon cannot start. DTU sets
+    # this by default, but it is stated explicitly because the whole design
+    # depends on it.
+    security.nesting: "true"
+    limits.cpu: "8"
+    limits.memory: "16GiB"
+
+passthrough:
+  allow_external: true
+  services:
+    # The pipeline's own agent calls.
+    - name: anthropic
+      key_env: ANTHROPIC_API_KEY
+    # The ledgerfmt reference fixture repository is private.
+    - name: github
+      key_env: GH_TOKEN
+
+provision:
+  setup_cmds:
+    # --- base tooling ------------------------------------------------------
+    - |
+      set -euo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      timeout 180 apt-get update
+      timeout 600 apt-get install -y \
+        ca-certificates curl gnupg git jq python3 python3-venv
+
+    # --- Incus apt repo (Zabbly stable; noble = Ubuntu 24.04) --------------
+    - |
+      set -euo pipefail
+      install -m 0755 -d /etc/apt/keyrings
+      timeout 30 curl -fsSL --max-time 20 \
+        https://pkgs.zabbly.com/key.asc -o /etc/apt/keyrings/zabbly.asc
+      chmod a+r /etc/apt/keyrings/zabbly.asc
+      ARCH=$(dpkg --print-architecture)
+      cat > /etc/apt/sources.list.d/zabbly-incus-stable.sources <<EOF
+      Enabled: yes
+      Types: deb
+      URIs: https://pkgs.zabbly.com/incus/stable
+      Suites: noble
+      Components: main
+      Architectures: ${ARCH}
+      Signed-By: /etc/apt/keyrings/zabbly.asc
+      EOF
+
+    - |
+      set -euo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      timeout 180 apt-get update
+      timeout 600 apt-get install -y incus incus-base incus-client
+
+    # --- inner Incus daemon ------------------------------------------------
+    # Start via systemd; a manual `incusd &` races the auto-started socket unit
+    # and hangs the init commands below.
+    - |
+      set -euo pipefail
+      if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        timeout 30 systemctl enable --now incus.socket incus.service
+      else
+        nohup incusd >/var/log/incusd.log 2>&1 &
+      fi
+      for i in $(seq 1 60); do
+        [ -S /var/lib/incus/unix.socket ] && break
+        sleep 1
+      done
+      if [ ! -S /var/lib/incus/unix.socket ]; then
+        echo "ERROR: inner Incus socket missing at /var/lib/incus/unix.socket"
+        (journalctl -u incus --no-pager -n 100 2>/dev/null) || true
+        exit 1
+      fi
+      echo "inner Incus up after ${i}s"
+
+    - timeout 120 incus admin init --minimal
+    # Privileged relative to THIS container only; the outer user namespace
+    # remains the host boundary. reality_check's clean rooms need it to install
+    # packages and run services.
+    - timeout 15 incus profile set default security.privileged=true
+
+    # --- uv + CLIs ---------------------------------------------------------
+    - |
+      set -euo pipefail
+      timeout 120 curl -LsSf --max-time 60 https://astral.sh/uv/install.sh | sh
+
+    # attractor from the fork branch carrying the root source_dir fix.
+    - |
+      set -euo pipefail
+      export PATH="$HOME/.local/bin:$PATH"
+      timeout 900 uv tool install --force \
+        "git+https://github.com/robotdad/amplifier-bundle-attractor@${ATTRACTOR_REF}#subdirectory=modules/pipeline-runner"
+
+    - |
+      set -euo pipefail
+      export PATH="$HOME/.local/bin:$PATH"
+      timeout 600 uv tool install --force \
+        git+https://github.com/microsoft/amplifier-bundle-digital-twin-universe
+
+    # --- the evaluation package, pinned --------------------------------------
+    - |
+      set -euo pipefail
+      mkdir -p /workspace
+      timeout 300 git clone https://github.com/robotdad/pipelines.git /workspace/pipelines
+      git -C /workspace/pipelines checkout --quiet "${PIPELINES_SHA}"
+      git -C /workspace/pipelines rev-parse HEAD
+
+    # --- attractor provider config ------------------------------------------
+    - |
+      set -euo pipefail
+      mkdir -p "$HOME/.amplifier"
+      cat > "$HOME/.amplifier/settings.yaml" <<'EOF'
+      providers:
+        anthropic:
+          module: provider-anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+      EOF
+
+readiness:
+  - name: inner-incus
+    command: "incus info >/dev/null"
+  - name: attractor
+    command: "$HOME/.local/bin/attractor --help >/dev/null"
+  - name: dtu-cli
+    command: "$HOME/.local/bin/amplifier-digital-twin --version"
+  - name: evaluation-package
+    command: "test -f /workspace/pipelines/evaluations/harness.py"
+  - name: pipeline-package
+    command: "test -f /workspace/pipelines/expert_builder/admit/admit.dot"
