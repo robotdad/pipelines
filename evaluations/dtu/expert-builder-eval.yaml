@@ -149,10 +149,15 @@ provision:
     - |
       set -euo pipefail
       export PATH="$HOME/.local/bin:$PATH"
-      timeout 120 $HOME/.local/bin/attractor --help >/dev/null 2>&1 || true
-      D=$(ls -d $HOME/.amplifier/cache/amplifier-bundle-attractor-* 2>/dev/null | head -1)
+      # The bundle cache is populated by a real run, not by --help, so drive a
+      # trivial pipeline first. It needs no provider and is expected to succeed.
+      mkdir -p /tmp/cache-warm && cd /tmp/cache-warm
+      printf 'digraph w { start [shape=Mdiamond]; done [shape=Msquare]; start -> done; }\n' > warm.dot
+      timeout 300 $HOME/.local/bin/attractor run warm.dot --cwd . >/dev/null 2>&1 || true
+      D=$(ls -d $HOME/.amplifier/cache/amplifier-bundle-attractor-* 2>/dev/null | head -1 || true)
       if [ -z "$D" ]; then
-        echo "ERROR: attractor bundle cache not found; did the CLI install run?"
+        echo "ERROR: attractor bundle cache not populated after a warm-up run"
+        ls -la $HOME/.amplifier/cache 2>/dev/null || echo "(no cache dir)"
         exit 1
       fi
       git -C "$D" remote add fork https://github.com/robotdad/amplifier-bundle-attractor.git 2>/dev/null || true
