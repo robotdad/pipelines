@@ -194,6 +194,7 @@ def grade_fidelity(brief: dict, target: Path, run_dir: Path) -> dict:
         [
             "uv",
             "run",
+            "--no-project",
             "--with",
             "pytest",
             "--with",
