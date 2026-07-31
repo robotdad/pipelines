@@ -46,19 +46,6 @@ base:
     limits.cpu: "8"
     limits.memory: "16GiB"
 
-# The attractor BUNDLE hardcodes microsoft/amplifier-bundle-attractor@main as
-# the source for its loop-pipeline module (bundles/attractor-pipeline.yaml).
-# That clone is what lands in ~/.amplifier/cache and gets inserted at
-# sys.path[0] when the module is mounted -- so installing the CLI from a fork
-# silently still gets upstream's engine. Redirect the bundle clone here rather
-# than editing the fork's bundle yaml, which keeps the branch clean for the
-# upstream PR. Remove this block once the fix lands upstream.
-url_rewrites:
-  default_match_mode: boundary
-  rules:
-    - match: github.com/microsoft/amplifier-bundle-attractor
-      target: https://github.com/robotdad/amplifier-bundle-attractor
-
 passthrough:
   allow_external: true
   services:
@@ -147,6 +134,43 @@ provision:
       export PATH="$HOME/.local/bin:$PATH"
       timeout 600 uv tool install --force \
         git+https://github.com/microsoft/amplifier-bundle-digital-twin-universe
+
+    # --- point the mounted engine at the fork --------------------------------
+    # The attractor BUNDLE hardcodes microsoft/amplifier-bundle-attractor@main
+    # as the source for its loop-pipeline module (bundles/attractor-pipeline.yaml).
+    # That clone is what lands in ~/.amplifier/cache and gets inserted at
+    # sys.path[0] when the module is mounted, so installing the CLI from a fork
+    # still loads upstream's engine. url_rewrites does not reach this clone --
+    # it was tried and the cached bundle came back unredirected.
+    #
+    # Re-point the cache directly. Blunt, but it lives in the profile, so the
+    # environment stays reproducible from one artifact. Delete this block once
+    # the source_dir fix lands upstream.
+    - |
+      set -euo pipefail
+      export PATH="$HOME/.local/bin:$PATH"
+      timeout 120 $HOME/.local/bin/attractor --help >/dev/null 2>&1 || true
+      D=$(ls -d $HOME/.amplifier/cache/amplifier-bundle-attractor-* 2>/dev/null | head -1)
+      if [ -z "$D" ]; then
+        echo "ERROR: attractor bundle cache not found; did the CLI install run?"
+        exit 1
+      fi
+      git -C "$D" remote add fork https://github.com/robotdad/amplifier-bundle-attractor.git 2>/dev/null || true
+      timeout 300 git -C "$D" fetch -q --depth 50 fork "${ATTRACTOR_REF}"
+      git -C "$D" checkout -q -B pinned "fork/${ATTRACTOR_REF}"
+      grep -q "source_dir" "$D/modules/loop-pipeline/amplifier_module_loop_pipeline/remote_dot.py" \
+        || { echo "ERROR: cache re-point did not take"; exit 1; }
+      echo "engine pinned to fork/${ATTRACTOR_REF} at $(git -C "$D" rev-parse --short HEAD)"
+
+    # --- git credentials for the private fixture reference repository --------
+    - |
+      set -euo pipefail
+      if [ -n "${GH_TOKEN:-}" ]; then
+        git config --global \
+          url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
+      else
+        echo "WARNING: GH_TOKEN unset; private reference fixtures will not clone"
+      fi
 
     # --- the evaluation package, pinned --------------------------------------
     - |
