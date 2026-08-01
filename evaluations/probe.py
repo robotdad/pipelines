@@ -282,6 +282,10 @@ def main() -> int:
     parser.add_argument("--brief", default="ledgerstat")
     parser.add_argument("--provider", default="anthropic")
     parser.add_argument("--timeout", type=int, default=2400)
+    parser.add_argument(
+        "--max-turns",
+        help="Override the node's max_agent_turns. Starving the budget reproduces\n        the end-to-end condition where allow_partial accepts a truncated run.",
+    )
     args = parser.parse_args()
 
     from evaluations.harness import load_brief
@@ -294,6 +298,10 @@ def main() -> int:
     run_dir.mkdir(parents=True)
 
     declaration = extract_node(PIPELINES_ROOT / dot_relative, args.node)
+    if args.max_turns:
+        declaration = re.sub(
+            r'max_agent_turns="\d+"', f'max_agent_turns="{args.max_turns}"', declaration
+        )
     probe_dot = run_dir / "probe.dot"
     probe_dot.write_text(build_probe_dot(args.node, declaration), encoding="utf-8")
 
