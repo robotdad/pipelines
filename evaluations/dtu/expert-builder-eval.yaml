@@ -14,9 +14,24 @@
 #   containers are then ordinary children of that daemon: destroying this
 #   environment destroys them too.
 #
-#   Modelled on the DTU bundle's own dtu-host-in-incus profile. Docker and Gitea
-#   are omitted -- reality_check drives DTUs via exec/file-push only, and both
-#   repositories we need are on GitHub.
+#   Modelled on the DTU bundle's own dtu-host-in-incus profile. Gitea is omitted
+#   -- both repositories we need are on GitHub.
+#
+# WHY DOCKER IS INSTALLED DESPITE NOTHING USING IT
+#   Omitting it was the original intent, and it silently broke every run.
+#   `amplifier-digital-twin destroy` shells out to the `docker` binary even for
+#   an Incus-backed instance, so with Docker absent reality_check could launch
+#   its clean room but never tear it down:
+#
+#     Error: [Errno 2] No such file or directory: 'docker'   (exit 1)
+#
+#   The pipeline handled that correctly -- it recorded the failed destroy and
+#   reported evaluation_infrastructure_failed rather than claiming a pass -- so
+#   the symptom read as an RC defect for two sessions while the real cause was
+#   this profile. Verified both directions in a live DTU: destroy exits 1 with
+#   Docker absent, and returns {"destroyed": true} with it present.
+#
+#   Only the client binary is needed; the daemon is never started.
 #
 # WHY A FORK OF ATTRACTOR
 #   A root DOT loaded from a file kept an empty source_dir, so relative
@@ -64,7 +79,8 @@ provision:
       export DEBIAN_FRONTEND=noninteractive
       timeout 180 apt-get update
       timeout 600 apt-get install -y \
-        ca-certificates curl gnupg git jq python3 python3-venv
+        ca-certificates curl gnupg git jq python3 python3-venv \
+        docker.io
 
     # --- Incus apt repo (Zabbly stable; noble = Ubuntu 24.04) --------------
     - |
