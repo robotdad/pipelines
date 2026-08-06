@@ -1,0 +1,131 @@
+// Pure Attractor implementation-to-PR pipeline.
+//
+// Package contract:
+//   Entrypoint: git+https://github.com/robotdad/pipelines@main#subdirectory=implement/implement.dot
+//   Required params: task, test_command
+//   Resolve-provided workspace context: workspace_repo (owner/repo)
+//   Optional param: branch_name
+//
+// Shape vocabulary:
+//   Mdiamond / Msquare = entry / terminal
+//   box                = LLM stage
+//   parallelogram      = deterministic shell stage
+//
+// All transient run evidence belongs in .ai/implement/. Commit explicitly unstages all .ai state.
+// The pipeline pushes to an explicit github.com URL, never the hosted Gitea origin.
+
+digraph implement_to_pr {
+  graph [
+    label="Implement Session-Distilled Task to Verified GitHub PR",
+    labelloc="t",
+    rankdir="LR",
+    goal="$task",
+    params="task,test_command,branch_name",
+    "param.task"="TextField:longText:Session-distilled implementation task:required",
+    "param.test_command"="TextField:shortText:Exact test command:required",
+    "param.branch_name"="TextField:shortText:GitHub branch name (optional)",
+    default_max_retry=0,
+    default_fidelity="truncate",
+    max_pipeline_duration="7200s"
+  ];
+
+  node [fontname="Helvetica"];
+  edge [fontname="Helvetica"];
+
+  Start [shape=Mdiamond, label="Start"];
+  Exit [shape=Msquare, label="Verified PR"];
+  FailLoud [
+    shape=parallelogram,
+    label="Fail loud",
+    tool_command="#!/bin/sh\nprintf '%s\n' 'Pipeline stopped on an explicit failure path; inspect the preceding stage evidence.' >&2\nexit 1"
+  ];
+
+  Implement [
+    shape=box,
+    label="Implement",
+    fidelity="full",
+    llm_provider="anthropic",
+    llm_model="claude-sonnet-4-6",
+    reasoning_effort="high",
+    max_agent_turns=80,
+    timeout="1800s",
+    prompt="You are the implementation engineer in the current repository. Implement this session-distilled task:\n\n$task\n\nRead the repository conventions and the relevant code before changing it. If .ai/implement/review.json exists with verdict 'repair', use its actionable feedback to refine the implementation. Add or update focused tests when the task warrants them, and run focused checks needed to establish the change. Write concise implementation evidence to .ai/implement/implementation.md, including changed files and focused checks run."
+  ];
+
+  Test [
+    shape=parallelogram,
+    label="Run supplied tests",
+    tool_env="test_command",
+    timeout="1800s",
+    tool_command="#!/bin/sh\nset -eu\nmkdir -p .ai/implement\nif [ ! -s .ai/implement/implementation.md ]; then\n  echo 'ERROR: Implement did not write required .ai/implement/implementation.md evidence.' >&2\n  exit 1\nfi\nif [ -z \"${TEST_COMMAND:-}\" ]; then\n  echo 'ERROR: required test_command was not provided.' >&2\n  exit 1\nfi\nprintf '%s\\n' \"$TEST_COMMAND\" > .ai/implement/test-command.txt\nsh -c \"$TEST_COMMAND\" > .ai/implement/test-output.txt 2>&1\nprintf '%s\\n' 'tests_passed' >> .ai/implement/test-output.txt\nprintf '%s\\n' 'tests_passed'"
+  ];
+
+  Review [
+    shape=box,
+    label="Independent review",
+    fidelity="full",
+    llm_provider="anthropic",
+    llm_model="claude-sonnet-4-6",
+    reasoning_effort="high",
+    max_agent_turns=50,
+    timeout="1800s",
+    prompt="Independently review the current repository against this session-distilled task:\n\n$task\n\nInspect the implementation, its tests, git diff, .ai/implement/implementation.md, and .ai/implement/test-output.txt. Write .ai/implement/review.json as exactly one JSON object with this schema: {\"verdict\":\"pass\"|\"repair\",\"feedback\":\"...\"}. Use verdict 'pass' only when the task is met and the supplied tests provide the expected evidence. Use verdict 'repair' with concise, actionable feedback when the implementation needs correction."
+  ];
+
+  Decide [
+    shape=parallelogram,
+    label="Classify review deterministically",
+    timeout="60s",
+    tool_command="#!/bin/sh\nset -eu\nmkdir -p .ai/implement\npython3 - <<'PYEOF'\nimport json\nimport os\nimport sys\n\nreview_path = '.ai/implement/review.json'\nstate_path = '.ai/implement/review-state.json'\ntry:\n    with open(review_path, encoding='utf-8') as handle:\n        review = json.load(handle)\nexcept (OSError, json.JSONDecodeError) as error:\n    print('ERROR: review artifact is missing or invalid: %s' % error, file=sys.stderr)\n    print('review_invalid')\n    raise SystemExit(0)\n\nif not isinstance(review, dict) or set(review) != {'verdict', 'feedback'}:\n    print('ERROR: review artifact must contain only verdict and feedback.', file=sys.stderr)\n    print('review_invalid')\n    raise SystemExit(0)\n\nverdict = review.get('verdict')\nfeedback = review.get('feedback')\nif verdict == 'pass' and isinstance(feedback, str):\n    decision = 'review_pass'\nelif verdict == 'repair' and isinstance(feedback, str) and feedback.strip():\n    try:\n        with open(state_path, encoding='utf-8') as handle:\n            state = json.load(handle)\n    except (OSError, json.JSONDecodeError):\n        state = {}\n    repairs = int(state.get('repairs', 0)) + 1\n    state = {'repairs': repairs, 'last_feedback': feedback}\n    with open(state_path, 'w', encoding='utf-8') as handle:\n        json.dump(state, handle, indent=2)\n        handle.write(chr(10))\n    decision = 'repair' if repairs == 1 else 'repair_exhausted'\nelse:\n    print('ERROR: review verdict must be pass or repair with string feedback.', file=sys.stderr)\n    decision = 'review_invalid'\n\nprint(decision)\nPYEOF"
+  ];
+
+  Commit [
+    shape=parallelogram,
+    label="Commit tested change",
+    tool_env="workspace_repo,branch_name",
+    timeout="180s",
+    tool_command="#!/bin/sh\nset -eu\nmkdir -p .ai/implement\npython3 - <<'PYEOF'\nimport json\nimport os\nimport re\nimport subprocess\nimport sys\nfrom datetime import datetime, timezone\n\ngit_env = dict(os.environ)\ngit_env.update({\n    'GIT_CONFIG_GLOBAL': os.devnull,\n    'GIT_CONFIG_NOSYSTEM': '1',\n    'GIT_CONFIG_SYSTEM': os.devnull,\n    'GIT_TERMINAL_PROMPT': '0',\n})\n\ndef run_git(args, *, check=True, **kwargs):\n    return subprocess.run(\n        ['git', '-c', 'core.hooksPath=/dev/null', *args],\n        text=True,\n        check=check,\n        env=git_env,\n        **kwargs,\n    )\n\nrepo = os.environ.get('WORKSPACE_REPO', '').strip()\nif not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo):\n    print('ERROR: Resolve must provide workspace_repo as owner/repo.', file=sys.stderr)\n    raise SystemExit(1)\n\nrun_git(['rev-parse', '--is-inside-work-tree'], stdout=subprocess.DEVNULL)\nbase = 'main'\nbranch = os.environ.get('BRANCH_NAME', '').strip()\nif not branch:\n    stamp = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')\n    branch = 'resolve/implement-' + stamp\nif branch in {'main', base}:\n    print('ERROR: publication branch cannot be main or the base branch.', file=sys.stderr)\n    raise SystemExit(1)\nif not branch.startswith('resolve/implement-') or len(branch) == len('resolve/implement-'):\n    print('ERROR: branch_name must be under resolve/implement-*.', file=sys.stderr)\n    raise SystemExit(1)\nif run_git(['check-ref-format', '--branch', branch], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:\n    print('ERROR: invalid branch_name: %s' % branch, file=sys.stderr)\n    raise SystemExit(1)\n\nrun_git(['switch', '-C', branch])\nrun_git(['add', '-A'])\nrun_git(['reset', '--', '.ai'])\nstaged = run_git(['diff', '--cached', '--name-only'], stdout=subprocess.PIPE).stdout.splitlines()\nleaked = [path for path in staged if path == '.ai' or path.startswith('.ai/')]\nif leaked:\n    print('ERROR: .ai state remains staged: ' + ', '.join(leaked), file=sys.stderr)\n    raise SystemExit(1)\nif not staged:\n    print('ERROR: no tested repository changes are staged for commit.', file=sys.stderr)\n    raise SystemExit(1)\nrun_git([\n    '-c', 'user.email=resolve@local', '-c', 'user.name=Resolve',\n    'commit', '--no-verify', '-m', 'resolve: implement session-distilled task',\n])\ncommit = run_git(['rev-parse', 'HEAD'], stdout=subprocess.PIPE).stdout.strip()\nmetadata = {\n    'repo': repo,\n    'branch': branch,\n    'base': 'main',\n    'commit': commit,\n    'staged_files': staged,\n}\nwith open('.ai/implement/delivery.json', 'w', encoding='utf-8') as handle:\n    json.dump(metadata, handle, indent=2)\n    handle.write(chr(10))\nprint('committed')\nPYEOF"
+  ];
+
+  Publish [
+    shape=parallelogram,
+    label="Publish direct GitHub PR",
+    tool_env="workspace_repo",
+    timeout="300s",
+    tool_command="#!/bin/sh\nset -eu\nmkdir -p .ai/implement\npython3 - <<'PYEOF'\nimport json\nimport os\nimport subprocess\nimport sys\n\nrepo = os.environ.get('WORKSPACE_REPO', '').strip()\ntoken = os.environ.get('GH_TOKEN', '')\nif not token:\n    print('ERROR: GH_TOKEN is unavailable for direct GitHub publication.', file=sys.stderr)\n    raise SystemExit(1)\nwith open('.ai/implement/delivery.json', encoding='utf-8') as handle:\n    delivery = json.load(handle)\nif delivery.get('repo') != repo:\n    print('ERROR: delivery repository does not match workspace_repo.', file=sys.stderr)\n    raise SystemExit(1)\nbase = 'main'\ngit_env = dict(os.environ)\ngit_env.update({\n    'GIT_CONFIG_GLOBAL': os.devnull,\n    'GIT_CONFIG_NOSYSTEM': '1',\n    'GIT_CONFIG_SYSTEM': os.devnull,\n    'GIT_TERMINAL_PROMPT': '0',\n})\n\ndef run(args, **kwargs):\n    return subprocess.run(args, text=True, check=True, env=git_env, **kwargs)\n\ndef run_git(args, **kwargs):\n    return run(['git', '-c', 'core.hooksPath=/dev/null', *args], **kwargs)\n\nbranch = run_git(['symbolic-ref', '--short', 'HEAD'], stdout=subprocess.PIPE).stdout.strip()\ncommit = run_git(['rev-parse', 'HEAD'], stdout=subprocess.PIPE).stdout.strip()\nif branch in {'main', base} or not branch.startswith('resolve/implement-') or len(branch) == len('resolve/implement-'):\n    print('ERROR: current branch must be under resolve/implement-* and cannot be the base branch.', file=sys.stderr)\n    raise SystemExit(1)\nif delivery.get('branch') != branch or delivery.get('commit') != commit or delivery.get('base') != base:\n    print('ERROR: Git branch or HEAD does not match delivery reporting artifacts.', file=sys.stderr)\n    raise SystemExit(1)\ngithub_url = 'https://github.com/%s.git' % repo\ncredential_helper = '!f() { echo username=x-access-token; echo password=$GH_TOKEN; }; f'\n\nrun_git(['-c', 'credential.helper=' + credential_helper, 'push', '--no-verify', github_url, 'HEAD:refs/heads/' + branch])\nremote = run_git(['-c', 'credential.helper=' + credential_helper, 'ls-remote', github_url, 'refs/heads/' + branch], stdout=subprocess.PIPE).stdout.strip().split()\nif not remote or remote[0] != commit:\n    print('ERROR: GitHub branch does not contain the tested commit.', file=sys.stderr)\n    raise SystemExit(1)\nbody_path = '.ai/implement/pr-body.md'\nwith open('.ai/implement/test-command.txt', encoding='utf-8') as handle:\n    test_command = handle.read().strip()\nwith open(body_path, 'w', encoding='utf-8') as handle:\n    handle.write('Implements the session-distilled task.' + chr(10) + chr(10) + 'Test command passed:' + chr(10) + '`' + test_command + '`' + chr(10))\nrun(['gh', 'pr', 'create', '--repo', repo, '--base', 'main', '--head', branch, '--title', 'Implement session-distilled task', '--body-file', body_path])\nprs = run(['gh', 'pr', 'list', '--repo', repo, '--head', branch, '--base', 'main', '--state', 'open', '--json', 'url,number,headRefName,baseRefName,headRefOid,state', '--limit', '2'], stdout=subprocess.PIPE).stdout\nmatches = json.loads(prs)\nif len(matches) != 1:\n    print('ERROR: expected exactly one open GitHub PR for branch %s.' % branch, file=sys.stderr)\n    raise SystemExit(1)\npr = matches[0]\nif pr['headRefName'] != branch or pr['baseRefName'] != 'main' or pr['headRefOid'] != commit or pr['state'] != 'OPEN':\n    print('ERROR: created PR does not have the expected GitHub head, base, or state.', file=sys.stderr)\n    raise SystemExit(1)\ndelivery['pr_url'] = pr['url']\ndelivery['pr_number'] = pr['number']\nwith open('.ai/implement/delivery.json', 'w', encoding='utf-8') as handle:\n    json.dump(delivery, handle, indent=2)\n    handle.write(chr(10))\nprint('published')\nPYEOF"
+  ];
+
+  VerifyPR [
+    shape=parallelogram,
+    label="Verify GitHub branch and PR",
+    tool_env="workspace_repo",
+    timeout="120s",
+    tool_command="#!/bin/sh\nset -eu\npython3 - <<'PYEOF'\nimport json\nimport os\nimport subprocess\nimport sys\n\nrepo = os.environ.get('WORKSPACE_REPO', '').strip()\nwith open('.ai/implement/delivery.json', encoding='utf-8') as handle:\n    delivery = json.load(handle)\nbase = 'main'\ngit_env = dict(os.environ)\ngit_env.update({\n    'GIT_CONFIG_GLOBAL': os.devnull,\n    'GIT_CONFIG_NOSYSTEM': '1',\n    'GIT_CONFIG_SYSTEM': os.devnull,\n    'GIT_TERMINAL_PROMPT': '0',\n})\n\ndef run(args, **kwargs):\n    return subprocess.run(args, text=True, check=True, env=git_env, **kwargs)\n\ndef run_git(args, **kwargs):\n    return run(['git', '-c', 'core.hooksPath=/dev/null', *args], **kwargs)\n\nbranch = run_git(['symbolic-ref', '--short', 'HEAD'], stdout=subprocess.PIPE).stdout.strip()\ncommit = run_git(['rev-parse', 'HEAD'], stdout=subprocess.PIPE).stdout.strip()\nif branch in {'main', base} or not branch.startswith('resolve/implement-') or len(branch) == len('resolve/implement-'):\n    print('ERROR: current branch must be under resolve/implement-* and cannot be the base branch.', file=sys.stderr)\n    raise SystemExit(1)\nif delivery.get('repo') != repo or delivery.get('branch') != branch or delivery.get('commit') != commit or delivery.get('base') != base:\n    print('ERROR: Git repository state does not match delivery reporting artifacts.', file=sys.stderr)\n    raise SystemExit(1)\ngithub_url = 'https://github.com/%s.git' % repo\ncredential_helper = '!f() { echo username=x-access-token; echo password=$GH_TOKEN; }; f'\n\nremote = run_git(['-c', 'credential.helper=' + credential_helper, 'ls-remote', github_url, 'refs/heads/' + branch], stdout=subprocess.PIPE).stdout.strip().split()\nif not remote or remote[0] != commit:\n    print('ERROR: GitHub branch verification failed for tested commit.', file=sys.stderr)\n    raise SystemExit(1)\nprs = run(['gh', 'pr', 'list', '--repo', repo, '--head', branch, '--base', 'main', '--state', 'open', '--json', 'url,number,headRefName,baseRefName,headRefOid,state', '--limit', '2'], stdout=subprocess.PIPE).stdout\nmatches = json.loads(prs)\nif len(matches) != 1:\n    print('ERROR: expected exactly one open PR during verification.', file=sys.stderr)\n    raise SystemExit(1)\npr = matches[0]\nif pr['headRefName'] != branch or pr['baseRefName'] != 'main' or pr['headRefOid'] != commit or pr['state'] != 'OPEN':\n    print('ERROR: verified PR does not have the expected head, base, or state.', file=sys.stderr)\n    raise SystemExit(1)\ndelivery['verified_pr_url'] = pr['url']\ndelivery['verified_at'] = 'github'\nwith open('.ai/implement/delivery.json', 'w', encoding='utf-8') as handle:\n    json.dump(delivery, handle, indent=2)\n    handle.write(chr(10))\nprint('verified')\nPYEOF"
+  ];
+
+  Start -> Implement;
+
+  Implement -> Test [condition="outcome=success"];
+  Implement -> FailLoud [condition="outcome=fail", label="implementation failed"];
+
+  Test -> Review [condition="outcome=success"];
+  Test -> FailLoud [condition="outcome=fail", label="tests failed"];
+
+  Review -> Decide [condition="outcome=success"];
+  Review -> FailLoud [condition="outcome=fail", label="review failed"];
+
+  Decide -> Commit [condition="context.tool.last_line=review_pass && outcome=success", label="pass"];
+  Decide -> Implement [condition="context.tool.last_line=repair && outcome=success", loop_restart=true, label="repair once"];
+  Decide -> FailLoud [condition="context.tool.last_line=repair_exhausted && outcome=success", label="repair exhausted"];
+  Decide -> FailLoud [condition="context.tool.last_line=review_invalid && outcome=success", label="invalid review"];
+  Decide -> FailLoud [condition="outcome=fail", label="decision failed"];
+
+  Commit -> Publish [condition="outcome=success"];
+  Commit -> FailLoud [condition="outcome=fail", label="commit failed"];
+
+  Publish -> VerifyPR [condition="outcome=success"];
+  Publish -> FailLoud [condition="outcome=fail", label="publication failed"];
+
+  VerifyPR -> Exit [condition="outcome=success"];
+  VerifyPR -> FailLoud [condition="outcome=fail", label="verification failed"];
+}

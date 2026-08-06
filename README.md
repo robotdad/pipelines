@@ -11,6 +11,7 @@ plugin-specific glue.
 | Pipeline | Status | Summary |
 |---|---|---|
 | [`expert_builder/`](expert_builder/) | working-tree closure verified; remote CI gate on push/PR | Greenfield build-from-spec spine: admit → plan → implement → validate → reality-check → deliver |
+| [`implement/`](implement/) | demo pipeline; floating `main` intentional | Session-distilled task → test → review → one repair → direct, verified GitHub PR (`git+https://github.com/robotdad/pipelines@main#subdirectory=implement/implement.dot`) |
 
 ## Conventions
 

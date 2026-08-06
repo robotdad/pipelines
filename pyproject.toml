@@ -19,6 +19,7 @@ dev = [
 [tool.pytest.ini_options]
 addopts = "-p no:amplifier_module"
 pythonpath = ["."]
+testpaths = ["tests"]
 markers = [
     "remote: fetches a SHA-pinned pipeline package through Resolve's production materializer",
 ]
